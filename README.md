@@ -11,6 +11,24 @@ whole system through the tunnel (TUN) — with a password asked **once**.
 - **Tabs**: Connection, Servers, Subscriptions, Apps (split tunneling), TUN,
   Logs, About.
 
+## Screenshots
+
+The bar pill: status, the chosen server, live speed, and a switch.
+
+![Bar pill](docs/screenshots/widget.png)
+
+The **Connection** tab — server choice, TUN / proxy mode, autoconnect, ports and DNS.
+
+![Connection tab](docs/screenshots/connection.png)
+
+The **TUN** tab — what the privileged helper is, where it lives, and how to check it.
+
+![TUN helper tab](docs/screenshots/helper.png)
+
+The **About** tab — version, engine paths, IPC commands and licences.
+
+![About tab](docs/screenshots/about.png)
+
 ## How it works
 
 Two engines are looked up on the machine, not assumed (see *Requirements*):
@@ -139,6 +157,11 @@ Proxy mode needs none of the privileges: install the helper only if you want TUN
 | `status` | report the current status |
 | `panic` | the emergency brake: tear everything down at once |
 | `logs` | write the full log and diagnostics to the cache |
+| `select <n>` | choose server *n* from the list (0-based) |
+
+`select` only changes the chosen index and reconnects the way the UI does; it never touches
+the TUN directly. Note that switching is not instantaneous — a reconnect takes a few seconds,
+and the tunnel can briefly drop while it happens.
 
 ## Removing the helper
 

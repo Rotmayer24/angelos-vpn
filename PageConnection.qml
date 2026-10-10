@@ -10,7 +10,6 @@ import "Fmt.js" as Fmt
 Column {
     id: root
 
-    property var plugin
     width: parent ? parent.width : Skin.px(540)
     spacing: Skin.spacing
 
@@ -197,10 +196,9 @@ Column {
                 width: Skin.px(130)
                 text: String(Vpn.socksPort)
                 onAccepted: {
-                    var p = parseInt(text, 10);
-                    if (p > 0 && p < 65536)
-                        Vpn.setPorts(p, Vpn.httpPort);
-                    else
+                    // the setter validates and reports; on refusal the field snaps back so the
+                    // stored value and what is on screen never disagree
+                    if (!Vpn.setPorts(parseInt(text, 10), Vpn.httpPort))
                         text = String(Vpn.socksPort);
                 }
             }
@@ -212,10 +210,7 @@ Column {
                 width: Skin.px(130)
                 text: String(Vpn.httpPort)
                 onAccepted: {
-                    var p = parseInt(text, 10);
-                    if (p > 0 && p < 65536)
-                        Vpn.setPorts(Vpn.socksPort, p);
-                    else
+                    if (!Vpn.setPorts(Vpn.socksPort, parseInt(text, 10)))
                         text = String(Vpn.httpPort);
                 }
             }
@@ -227,7 +222,10 @@ Column {
                 width: Skin.px(170)
                 text: Vpn.dns
                 placeholder: "1.1.1.1"
-                onAccepted: Vpn.setDns(text.trim())
+                onAccepted: {
+                    if (!Vpn.setDns(text.trim()))
+                        text = Vpn.dns;
+                }
             }
         }
         PxText {

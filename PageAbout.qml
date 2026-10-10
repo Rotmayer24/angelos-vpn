@@ -56,19 +56,44 @@ Column {
             width: parent.width
             wrapMode: Text.Wrap
             dim: true
-            text: "Xray: " + Vpn.xrayPath
+            text: "Xray: " + (Vpn.xrayPath || I18n.t("не найден", "not found"))
         }
         PxText {
             width: parent.width
             wrapMode: Text.Wrap
             dim: true
-            text: I18n.t("TUN: ", "TUN: ") + "/opt/happ/bin/tun/sing-box"
+            // located at startup rather than hard-coded to one installer's /opt/happ
+            text: I18n.t("TUN: ", "TUN: ") + (Vpn.singBoxPath || I18n.t("не найден", "not found"))
         }
         PxText {
             width: parent.width
             wrapMode: Text.Wrap
             dim: true
             text: I18n.t("Кэш: ", "Cache: ") + Vpn.cacheDir
+        }
+    }
+
+    // Anything findbins.py could not locate. Without this the only trace was a line in the
+    // log, so a user whose machine has no sing-box just saw the plugin quietly not work.
+    PxGroup {
+        width: parent.width
+        visible: Vpn.missingBins.length > 0
+        title: I18n.t("Не хватает", "Missing")
+        // "info" is already used by this plugin's other groups; the pixel icon set is built
+        // into the shell rather than listed anywhere, so a proven name beats a guessed one
+        icon: "info"
+        PxText {
+            width: parent.width
+            wrapMode: Text.Wrap
+            color: Skin.danger
+            text: I18n.t("Не найдено: ", "Not found: ") + Vpn.missingBins.join(", ")
+        }
+        PxText {
+            width: parent.width
+            wrapMode: Text.Wrap
+            dim: true
+            text: I18n.t("Поставь Xray-core и sing-box (подойдут копии из Happ в /opt/happ/bin) или добавь их в PATH, затем перезагрузи angelOS. Без Xray не подключиться совсем, без sing-box работает только режим прокси.",
+                "Install Xray-core and sing-box (the copies bundled with Happ under /opt/happ/bin work too) or put them in PATH, then reload angelOS. Without Xray nothing connects; without sing-box only proxy mode works.")
         }
     }
 

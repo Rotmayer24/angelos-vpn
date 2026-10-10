@@ -827,6 +827,44 @@ gsettings set org.gnome.system.proxy.https port " + g(6, "443") + " 2>/dev/null;
         }
     }
     function setAutoconnect(v) { autoconnect = v; put("autoconnect", v); }
+    function setPorts(socks, http) {
+        // The stats API port is socks + 1000, so a socks port near the top of the range
+        // pushed it past 65535 and Xray died at connect time with a message that pointed
+        // nowhere. Reject here instead, in the one place every path goes through.
+        if (!validPortFor(socks) || !validPortFor(http)) {
+            message = tr("Порты должны быть от 1024 до 64535 (для порта статистики +1000)", "Ports must be 1024–64535 (the stats port is socks + 1000)");
+            log("rejected ports: socks=" + socks + " http=" + http);
+            return false;
+        }
+        if (socks === http) {
+            message = tr("Порты SOCKS и HTTP должны различаться", "The SOCKS and HTTP ports must differ");
+            log("rejected identical ports: " + socks);
+            return false;
+        }
+        socksPort = socks;
+        httpPort = http;
+        put("socksPort", socks);
+        put("httpPort", http);
+        return true;
+    }
+    // leaves room for the derived api port and stays clear of the privileged range
+    function validPortFor(p) {
+        p = parseInt(p, 10);
+        return p >= 1024 && p <= 64535;
+    }
+    function setDns(v) {
+        v = (v || "").trim();
+        // the helper validates this too, but it does so as root at connect time: a bad entry
+        // then surfaced as "TUN failed (pkexec 2)" with nothing pointing at the field
+        if (!/^[A-Za-z0-9._:-]+$/.test(v) || v.length > 255) {
+            message = tr("Не похоже на адрес DNS", "That does not look like a DNS address");
+            log("rejected a malformed DNS address");
+            return false;
+        }
+        dns = v;
+        put("dns", v);
+        return true;
+    }
     function setSystemProxy(v) {
         systemProxy = v;
         put("systemProxy", v);
@@ -840,13 +878,6 @@ gsettings set org.gnome.system.proxy.https port " + g(6, "443") + " 2>/dev/null;
     }
     function setKillSwitch(v) { killSwitch = v; put("killSwitch", v); }
     function setSplitOn(v) { splitOn = v; put("splitOn", v); restackIfOn(); }
-    function setDns(v) { dns = v; put("dns", v); }
-    function setPorts(socks, http) {
-        socksPort = socks;
-        httpPort = http;
-        put("socksPort", socks);
-        put("httpPort", http);
-    }
 
     function openSettings() {
         if (plugin && !loaded)
@@ -1191,6 +1222,15 @@ gsettings set org.gnome.system.proxy.https port " + g(6, "443") + " 2>/dev/null;
             root.log("helper up exit=" + code);
             if (code === 0) {
                 root.finalizeOn();
+            } else if (root.missingBins.indexOf("singbox") >= 0) {
+                // caught here rather than passed through: the helper's own message would be
+                // a root-side "sing-box not found at …", which tells the user nothing about
+                // where to put the binary
+                root.fail(root.tr("Не найден sing-box — TUN-режим не может работать. Поставь его или используй режим прокси.",
+                    "sing-box not found — TUN mode cannot work. Install it, or use proxy mode."));
+            } else if (root.missingBins.indexOf("xray") >= 0) {
+                root.fail(root.tr("Не найден Xray — подключиться нечем. Поставь Xray-core или добавь его в PATH.",
+                    "Xray not found — there is nothing to connect with. Install Xray-core or put it in PATH."));
             } else {
                 var why = e.split("\n").slice(-1)[0] || "";
                 root.fail(root.tr("TUN не поднялся", "TUN failed") + " (pkexec " + code + ")" + (root.helperInstalled ? (why ? ": " + why : "") : root.tr(": установи помощника", ": install the helper")));

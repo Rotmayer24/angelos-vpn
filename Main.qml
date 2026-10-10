@@ -52,6 +52,10 @@ Item {
         function logs(): void {
             Vpn.saveLogs();
         }
+        // lets a diagnostic script walk the server list without touching the UI
+        function select(i: int): void {
+            Vpn.selectServer(i);
+        }
     }
 
     LazyLoader {

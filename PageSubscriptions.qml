@@ -10,7 +10,6 @@ import "Fmt.js" as Fmt
 Column {
     id: root
 
-    property var plugin
     width: parent ? parent.width : Skin.px(540)
     spacing: Skin.spacing
 
@@ -213,8 +212,11 @@ Column {
         if (!u)
             return "";
         var s = Fmt.bytes(u.download) + " / " + Fmt.bytes(u.total);
-        if (u.expire > 0)
-            s += " · " + Fmt.until(u.expire);
+        if (u.expire > 0) {
+            var w = Fmt.until(u.expire);
+            if (w.date)
+                s += " · " + w.date + (w.days >= 0 ? " · " + w.days + " " + Fmt.daysUnit(w.days, I18n.t) : "");
+        }
         return s;
     }
 }

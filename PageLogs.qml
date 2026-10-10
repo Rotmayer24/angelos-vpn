@@ -11,7 +11,6 @@ import "."
 Column {
     id: root
 
-    property var plugin
     width: parent ? parent.width : Skin.px(560)
     spacing: Skin.spacing
 

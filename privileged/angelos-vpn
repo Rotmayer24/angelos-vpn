@@ -150,6 +150,48 @@ def resolve_v4(host):
     return sorted(ips)
 
 
+def pick_iface():
+    """A free interface name. Hard-coding one collides with another TUN client that got there
+    first, and the symptom is baffling: sing-box fails to create the device and the plugin
+    reports the tunnel as broken."""
+    # IFACE already ends in a digit ("angelvpn0"), so the series is numbered after the stem
+    # rather than after the whole name — otherwise the fallback reads "angelvpn01".
+    stem = IFACE.rstrip("0123456789")
+    for n in range(0, 16):
+        name = "%s%d" % (stem, n)
+        if not os.path.exists("/sys/class/net/" + name):
+            return name
+    return IFACE
+
+
+def tun_address():
+    """The tunnel address, avoiding a range the machine already routes.
+
+    A fixed 172.30.0.0/30 collides with a corporate LAN and quietly breaks the route, so the
+    first candidate that overlaps nothing already present wins."""
+    import ipaddress
+    try:
+        routes = subprocess.run(["ip", "-o", "route", "show"],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5)
+        existing = []
+        for line in routes.stdout.decode("utf-8", "replace").splitlines():
+            fields = line.split()
+            if not fields:
+                continue
+            try:
+                existing.append(ipaddress.ip_network(fields[0], strict=False))
+            except ValueError:
+                continue
+    except Exception:  # noqa: BLE001
+        existing = []
+    for net, first in (("172.30.0.0/30", "172.30.0.1"), ("172.31.0.0/30", "172.31.0.1"),
+                       ("10.203.0.0/30", "10.203.0.1")):
+        cand = ipaddress.ip_network(net)
+        if not any(cand.overlaps(e) for e in existing):
+            return first + "/30"
+    return "172.30.0.1/30"
+
+
 def build_config(socks, api, host, dns, apps, domains, kill):
     rules = [{"process_name": ["xray"], "outbound": "direct"}]
     for ip in resolve_v4(host):
@@ -183,8 +225,8 @@ def build_config(socks, api, host, dns, apps, domains, kill):
         "inbounds": [{
             "type": "tun",
             "tag": "tun-in",
-            "interface_name": IFACE,
-            "address": ["172.30.0.1/30"],
+            "interface_name": pick_iface(),
+            "address": [tun_address()],
             "mtu": 9000,
             "auto_route": True,
             "strict_route": bool(kill),

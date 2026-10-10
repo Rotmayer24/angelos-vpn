@@ -12,12 +12,13 @@ Column {
 
     signal requestTab(string tab)
 
-    property var plugin
     width: parent ? parent.width : Skin.px(540)
     spacing: Skin.spacing
 
     readonly property var list: {
-        var q = search.text.trim().toLowerCase();
+        // guarded: the search field is declared further down, and if it ever moves into a
+        // Loader this binding would evaluate to undefined and .trim() would blank the list
+        var q = search ? search.text.trim().toLowerCase() : "";
         var out = [];
         for (var i = 0; i < Vpn.servers.length; i++) {
             var s = Vpn.servers[i];

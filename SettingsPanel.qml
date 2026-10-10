@@ -71,35 +71,33 @@ Column {
         sourceComponent: root.tab === "connection" ? connC : root.tab === "servers" ? srvC : root.tab === "subs" ? subC : root.tab === "split" ? splitC : root.tab === "helper" ? helperC : root.tab === "logs" ? logsC : aboutC
     }
 
+    // Only PageAbout reads the plugin context (for the version). Passing it to every page as
+    // well was plumbing nobody used, and it invited the next reader to trust a property that
+    // may be null depending on how the panel was opened.
     Component {
         id: connC
         PageConnection {
-            plugin: root.plugin
         }
     }
     Component {
         id: srvC
         PageServers {
-            plugin: root.plugin
             onRequestTab: tab => root.tab = tab
         }
     }
     Component {
         id: subC
         PageSubscriptions {
-            plugin: root.plugin
         }
     }
     Component {
         id: splitC
         PageSplit {
-            plugin: root.plugin
         }
     }
     Component {
         id: helperC
         PageHelper {
-            plugin: root.plugin
         }
     }
     Component {
@@ -111,7 +109,6 @@ Column {
     Component {
         id: logsC
         PageLogs {
-            plugin: root.plugin
         }
     }
 }

@@ -26,13 +26,21 @@ function ping(v) {
     return Math.round(v) + " ms";
 }
 
+// "12.03.2027 · 30 d" — the day count comes back separately because plural rules differ per
+// language and Fmt.js has no access to I18n. A Russian "день" shown to an English user was
+// the bug this split avoids; see PageSubscriptions for the localized unit.
 function until(epochSec) {
     var t = Number(epochSec) || 0;
     if (t <= 0)
-        return "";
+        return { date: "", days: 0 };
     var d = new Date(t * 1000);
     var now = new Date();
-    var days = Math.round((d - now) / 86400000);
     var date = ("0" + d.getDate()).slice(-2) + "." + ("0" + (d.getMonth() + 1)).slice(-2) + "." + d.getFullYear();
-    return date + (days >= 0 ? " · " + days + " " + (days % 10 === 1 && days % 100 !== 11 ? "день" : "дн.") : "");
+    return { date: date, days: Math.round((d - now) / 86400000) };
+}
+
+// The word after the day count. Russian needs the 1 / 2-4 / 5+ cases; English does not.
+function daysUnit(days, t) {
+    var ru = (days % 10 === 1 && days % 100 !== 11) ? "день" : "дн.";
+    return t(ru, "d");
 }

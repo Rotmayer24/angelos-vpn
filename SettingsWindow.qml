@@ -18,9 +18,9 @@ FloatingWindow {
     implicitWidth: Skin.px(700)
     implicitHeight: Skin.px(760)
     minimumSize: Qt.size(Skin.px(520), Skin.px(460))
+    // only onClosed: onVisibleChanged also fires when the compositor merely hides the window
+    // (a workspace switch, for instance), which silently dismissed the user's settings
     onClosed: Vpn.closeSettings()
-    onVisibleChanged: if (!visible)
-        Vpn.closeSettings()
 
     // The settings skin for every Px* control inside (Only SettingsView sets it otherwise).
     Item {
