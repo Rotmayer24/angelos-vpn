@@ -1,0 +1,22 @@
+# Python bytecode — never belongs in the repository
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local test scratch
+*.log
+/tmp/
+
+# Runtime state: holds the Xray config with live credentials and cached subscriptions
+run.json
+sub-*.json
+sub-*.hdr
+plugin.log
+plugin-dump.txt
+
+# Editor / OS noise
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/

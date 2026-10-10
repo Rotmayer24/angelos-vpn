@@ -1,0 +1,490 @@
+#!/usr/bin/python3
+# angelOS: the VPN TUN helper. Runs as root through pkexec
+# (org.angelos.vpn.helper: the active session, no password after the one-time install).
+#
+#   angelos-vpn up <socksPort> <apiPort> <serverHost> <dns> <appsCsv> <domainsCsv> <killSwitch>
+#   angelos-vpn down
+#   angelos-vpn status
+#   angelos-vpn diag [host]                    diagnostics for the plugin's Logs tab
+#   angelos-vpn guard                          internal: tear the tunnel down if its shell dies
+#
+# It takes only validated numbers, one host name and two comma-separated lists, builds the
+# sing-box configuration itself and runs it: a TUN interface that sends everything to the
+# local Xray SOCKS port, except the Xray process itself (its link to the server), private
+# networks and the app / domain lists the user chose. No caller-supplied configuration is
+# ever passed to sing-box.
+import json
+import os
+import re
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import time
+
+# Fallback only: the plugin finds sing-box itself and passes the path in. Running a binary as
+# root is the whole reason this file is careful, so an explicitly passed path is checked.
+SB = "/opt/happ/bin/tun/sing-box"
+IFACE = "angelvpn0"
+RUNDIR = "/run/angelos-vpn"
+CFG = os.path.join(RUNDIR, "sing-box.json")
+PIDFILE = os.path.join(RUNDIR, "sing-box.pid")
+LOGFILE = os.path.join(RUNDIR, "sing-box.log")
+
+USAGE = ("usage: angelos-vpn up <socksPort> <apiPort> <host> <dns> <appsCsv> <domainsCsv> "
+         "<killSwitch> [<singBoxPath>] | down | status | diag [host] | guard")
+
+
+def fail(msg, code=2):
+    sys.stderr.write(msg + "\n")
+    sys.exit(code)
+
+
+def log_line(msg):
+    """A note for the diagnostics the plugin reads; never fatal."""
+    try:
+        os.makedirs(RUNDIR, mode=0o700, exist_ok=True)
+        with open(LOGFILE, "a") as f:
+            f.write(msg + "\n")
+    except OSError:
+        pass
+
+
+def valid_port(s):
+    if not s or not re.fullmatch(r"[0-9]{1,5}", s):
+        return None
+    v = int(s)
+    return v if 1 <= v <= 65535 else None
+
+
+def valid_host(s):
+    if not s or len(s) > 255:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9._:-]+", s):
+        return None
+    return s
+
+
+def valid_dns(s):
+    if not s or not re.fullmatch(r"[A-Za-z0-9._:-]+", s):
+        return None
+    return s
+
+
+def valid_singbox(s):
+    """A sing-box path that came from the caller. This process runs it as root, so the path
+    must be absolute, a real executable file, and must not be writable by anyone else — a
+    user-writable binary executed as root is privilege escalation, exactly what this helper
+    exists to avoid. The parent directory is checked for the same reason: a writable directory
+    lets the file be swapped after the check."""
+    if not s:
+        return SB
+    if not s.startswith("/") or len(s) > 4096 or "\0" in s or "\n" in s:
+        fail("bad sing-box path")
+    try:
+        st = os.stat(s)
+    except OSError:
+        fail("sing-box not found at " + s)
+    if not stat.S_ISREG(st.st_mode):
+        fail("sing-box is not a regular file: " + s)
+    if not os.access(s, os.X_OK):
+        fail("sing-box is not executable: " + s)
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        fail("refusing to run a group/world-writable sing-box as root: " + s)
+    # Not "must be owned by root": Happ ships its binaries owned by its build uid, and a
+    # strict root-only rule would break a perfectly normal install. The real threat is the
+    # *calling user* replacing the binary between the prompt and this exec, so the owner must
+    # not be that user. PKEXEC_UID is set by polkit itself in the environment of a program it
+    # starts, so it cannot be forged by the caller the way an argument could.
+    caller = os.environ.get("PKEXEC_UID", "")
+    caller_uid = int(caller) if caller.isdigit() else None
+    if caller_uid is not None and st.st_uid == caller_uid:
+        fail("refusing to run a sing-box owned by the calling user as root: " + s)
+    d = os.path.dirname(s)
+    try:
+        ds = os.stat(d)
+        if ds.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            fail("refusing: the directory holding sing-box is writable by others: " + d)
+        if caller_uid is not None and ds.st_uid == caller_uid:
+            fail("refusing: the directory holding sing-box belongs to the calling user: " + d)
+    except OSError:
+        pass
+    return s
+
+
+def clean_names(csv, maxlen=200, maxn=128):
+    out = []
+    for p in (csv or "").split(","):
+        p = p.strip()
+        if not p or len(p) > maxlen or not re.fullmatch(r"[A-Za-z0-9._+@-]+", p):
+            continue
+        if p not in out:
+            out.append(p)
+        if len(out) >= maxn:
+            break
+    return out
+
+
+def clean_domains(csv, maxn=256):
+    out = []
+    for d in (csv or "").split(","):
+        d = d.strip().lower()
+        if not d or len(d) > 253 or not re.fullmatch(r"\.?[a-z0-9*._-]+", d):
+            continue
+        if d not in out:
+            out.append(d)
+        if len(out) >= maxn:
+            break
+    return out
+
+
+def resolve_v4(host):
+    ips = set()
+    try:
+        for fam, _t, _p, _c, sa in socket.getaddrinfo(host, None):
+            if fam == socket.AF_INET:
+                ips.add(sa[0])
+    except OSError:
+        pass
+    return sorted(ips)
+
+
+def build_config(socks, api, host, dns, apps, domains, kill):
+    rules = [{"process_name": ["xray"], "outbound": "direct"}]
+    for ip in resolve_v4(host):
+        rules.append({"ip_cidr": [ip + "/32"], "outbound": "direct"})
+    # sing-box 1.11+ hijacks DNS only when asked explicitly. Without this the queries the
+    # TUN hands out (172.30.0.2:53) match ip_is_private further down and get sent into the
+    # void, so nothing resolves and every HTTPS call dies.
+    # NB: a rule without conditions matches *everything*, and hijack-dns is a final action
+    # that feeds the connection to the DNS module — so the port filter is mandatory, or
+    # ordinary TCP would be parsed as a DNS message and stall forever.
+    rules.append({"action": "hijack-dns", "port": 53})
+    rules.append({"ip_is_private": True, "outbound": "direct"})
+    if domains:
+        rules.append({"domain_suffix": domains, "outbound": "direct"})
+    if apps:
+        rules.append({"process_name": apps, "outbound": "direct"})
+    return {
+        "log": {"level": "info", "timestamp": True, "output": LOGFILE},
+        "dns": {
+            "servers": [
+                {"type": "udp", "tag": "remote", "server": dns, "detour": "proxy"},
+                {"type": "local", "tag": "local"},
+            ],
+            # split-tunnel domains are looked up locally so their name never leaves via
+            # the remote resolver before the route rule sends them direct.
+            "rules": ([{"domain_suffix": domains, "server": "local"}] if domains else []),
+            "final": "remote",
+            "strategy": "ipv4_only",
+            "independent_cache": True,
+        },
+        "inbounds": [{
+            "type": "tun",
+            "tag": "tun-in",
+            "interface_name": IFACE,
+            "address": ["172.30.0.1/30"],
+            "mtu": 9000,
+            "auto_route": True,
+            "strict_route": bool(kill),
+            # gvisor does TCP inside sing-box; "mixed" leans on the kernel redirect rules,
+            # which silently swallowed every connection on this box.
+            "stack": "gvisor",
+            "sniff": True,
+        }],
+        "outbounds": [
+            {"type": "socks", "tag": "proxy", "server": "127.0.0.1",
+             "server_port": socks, "version": "5", "domain_resolver": "local"},
+            {"type": "direct", "tag": "direct", "domain_resolver": "local"},
+        ],
+        "route": {
+            "rules": rules,
+            "final": "proxy",
+            "auto_detect_interface": True,
+            "default_domain_resolver": {"server": "local"},
+        },
+    }
+
+
+def read_pid():
+    try:
+        with open(PIDFILE) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def alive(pid):
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def stop_running():
+    pid = read_pid()
+    if alive(pid) and not is_sing_box(pid):
+        # The pid was recycled by an unrelated process; killing it would hit a stranger.
+        pid = 0
+    if alive(pid):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+        for _ in range(60):
+            if not alive(pid):
+                break
+            time.sleep(0.1)
+        if alive(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+            time.sleep(0.3)
+    try:
+        os.remove(PIDFILE)
+    except OSError:
+        pass
+    # fallback: sing-box usually removes the interface itself on SIGTERM
+    subprocess.run(["ip", "link", "delete", IFACE],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def is_sing_box(pid):
+    """A pid alone proves nothing: if sing-box died and the pid was recycled, SIGTERM
+    would land on whatever now owns it. Confirm the executable before signalling."""
+    try:
+        exe = os.readlink("/proc/%d/exe" % pid)
+    except OSError:
+        return False
+    return os.path.basename(exe).startswith("sing-box")
+
+
+def parse_up_args(argv):
+    if len(argv) not in (7, 8):
+        fail(USAGE)
+    socks = valid_port(argv[0])
+    api = valid_port(argv[1])
+    host = valid_host(argv[2])
+    dns = valid_dns(argv[3] or "1.1.1.1")
+    apps = clean_names(argv[4])
+    domains = clean_domains(argv[5])
+    kill = argv[6] in ("1", "true", "yes", "on")
+    if socks is None or api is None:
+        fail("bad port")
+    if host is None:
+        fail("bad host")
+    if dns is None:
+        fail("bad dns")
+    # optional: where sing-box actually is, since the plugin looks it up itself
+    sb = valid_singbox(argv[7] if len(argv) == 8 else "")
+    return socks, api, host, dns, apps, domains, kill, sb
+
+
+def cmd_up(argv):
+    socks, api, host, dns, apps, domains, kill, sb = parse_up_args(argv)
+    cfg = build_config(socks, api, host, dns, apps, domains, kill)
+    stop_running()
+    os.makedirs(RUNDIR, mode=0o700, exist_ok=True)
+    # makedirs leaves an existing directory's mode alone, so an older or pre-created
+    # /run/angelos-vpn would keep the config and log readable. This runs as root: fix it.
+    try:
+        os.chmod(RUNDIR, 0o700)
+    except OSError:
+        pass
+    with open(CFG, "w") as f:
+        json.dump(cfg, f, indent=2)
+    log = open(LOGFILE, "ab", buffering=0)
+    proc = subprocess.Popen([sb, "run", "-c", CFG],
+                            stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                            start_new_session=True)
+    with open(PIDFILE, "w") as f:
+        f.write(str(proc.pid))
+    # make sure it did not die on a bad config right away
+    time.sleep(1.3)
+    if proc.poll() is not None:
+        stop_running()
+        fail("sing-box exited (code %d); see %s" % (proc.returncode, LOGFILE), 1)
+    start_guard()
+    print("up")
+    return 0
+
+
+def shell_alive():
+    """Is any angelOS shell instance still running?
+
+    The plugin cannot tell us its own pid reliably: Quickshell runs the plugin's Process
+    children through a systemd scope, so their PPID is systemd, not the shell. Looking for
+    the shell itself is therefore both simpler and more robust than being handed a pid — it
+    does not care how the caller was started.
+    """
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == os.getpid():
+            continue
+        try:
+            with open("/proc/%d/cmdline" % pid, "rb") as f:
+                cmd = f.read().split(b"\0")
+        except OSError:
+            continue
+        # "qs -c angelos": quickshell's own binary running the angelOS config
+        if len(cmd) >= 2 and b"qs" in os.path.basename(cmd[0]) \
+                and any(a == b"angelos" for a in cmd[1:]):
+            return True
+        # the guard binary runs as "angelos-vpn guard"; never mistake it for the shell
+        if os.path.basename(cmd[0]) == "angelos-vpn":
+            continue
+    return False
+
+
+def start_guard():
+    """Keep a dead shell from holding the machine's network hostage.
+
+    sing-box is started with start_new_session, so it is not in angelOS's process group and
+    survives the shell. `qs kill` terminates the shell natively rather than exiting the
+    application, so no QML Component.onDestruction runs and the shell cannot be relied on to
+    clean up. This guard is its own root process: while a shell is running it does nothing,
+    and the moment the last one is gone it takes the tunnel down itself.
+    """
+    if not shell_alive():
+        # no shell to watch for: bringing the tunnel up now would already be orphaned
+        log_line("angelos-vpn: no angelOS shell is running, not starting the tunnel watchdog")
+    subprocess.Popen([sys.executable, os.path.abspath(__file__), "guard"],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def cmd_guard(argv):
+    """The watchdog. While an angelOS shell is running this does nothing; the moment the last
+    one is gone it takes the tunnel down and exits, so it never outlives a tunnel.
+
+    The shell is matched by process, not by a handed-in pid, because Quickshell starts the
+    plugin's child processes inside a systemd scope — their PPID is systemd, so the caller
+    cannot reliably report which process is the shell.
+    """
+    # one settle period: `up` may have been called just as a shell was restarting
+    time.sleep(3)
+    for _ in range(3600):
+        pid = read_pid()
+        if not alive(pid):
+            return 0               # the tunnel is already down, nothing left to guard
+        if shell_alive():
+            time.sleep(2)
+            continue
+        log_line("angelos-vpn: no angelOS shell is left, taking the tunnel down")
+        stop_running()
+        return 0
+    return 0
+
+
+def cmd_down(argv):
+    stop_running()
+    print("down")
+    return 0
+
+
+def cmd_status(argv):
+    pid = read_pid()
+    print("up" if alive(pid) else "down")
+    return 0
+
+
+# ---- diagnostics (read-only, for the plugin's Logs tab) ----------------------
+# Deliberately scoped to this tunnel. A blanket `ss -tulnp` or `nft list tables` would hand a
+# local user a map of every other process and firewall rule on the machine through a
+# passwordless root command; none of that helps diagnose the tunnel.
+
+def _run(cmd):
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=8)
+        return p.stdout.decode("utf-8", "replace").rstrip()
+    except Exception as e:  # noqa: BLE001
+        return "! %s: %s" % (" ".join(cmd), e)
+
+
+def _tail(path, n=150):
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        return "(cannot read %s: %s)" % (path, e)
+    lines = data.decode("utf-8", "replace").splitlines()
+    return "\n".join(lines[-n:])
+
+
+def _diag_text(host=""):
+    pid = read_pid()
+    parts = ["==== sing-box: %s (pid %s) ====" % ("up" if alive(pid) else "down", pid or "-")]
+    parts.append("==== sing-box log (tail 150) ====")
+    parts.append(_tail(LOGFILE, 150) or "(empty)")
+    parts.append("==== ip addr ====")
+    parts.append(_run(["ip", "-br", "addr"]))
+    parts.append("==== ip route (all tables) ====")
+    parts.append(_run(["ip", "route", "show", "table", "all"]))
+    parts.append("==== ip rule ====")
+    parts.append(_run(["ip", "rule", "show"]))
+    parts.append("==== route to 1.1.1.1 ====")
+    parts.append(_run(["ip", "route", "get", "1.1.1.1"]))
+    if host:
+        parts.append("==== route to server (%s) ====" % host)
+        parts.append(_run(["ip", "route", "get", host]))
+    parts.append("==== resolv.conf ====")
+    parts.append(_run(["cat", "/etc/resolv.conf"]))
+    # only the local ports this plugin owns, not every socket on the machine
+    ports = _our_ports()
+    parts.append("==== our listening ports (socks=%s api=%s) ====" % (
+        ports[0] if ports else "?", ports[1] if len(ports) > 1 else "?"))
+    for port in ports:
+        parts.append(_run(["ss", "-ltn", "sport", "=:%d" % port]))
+    return "\n".join(parts)
+
+
+def _our_ports():
+    """The ports the running config listens on, read back from it."""
+    try:
+        with open(CFG) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        return []
+    socks = api = None
+    for ib in cfg.get("inbounds") or []:
+        if ib.get("protocol") == "socks":
+            socks = ib.get("port")
+        elif ib.get("protocol") == "dokodemo-door":
+            api = ib.get("port")
+    return [p for p in (socks, api) if isinstance(p, int)]
+
+
+def cmd_diag(argv):
+    # the host is only ever echoed into a label and handed to `ip route get` as an argv
+    # entry (no shell), but validate it anyway so this root path stays strict
+    host = valid_host(argv[0]) if argv else ""
+    print(_diag_text(host or ""))
+    return 0
+
+
+def main(argv):
+    if not argv:
+        fail(USAGE)
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "up":
+        return cmd_up(rest)
+    if cmd == "down":
+        return cmd_down(rest)
+    if cmd == "status":
+        return cmd_status(rest)
+    if cmd == "diag":
+        return cmd_diag(rest)
+    if cmd == "guard":
+        return cmd_guard(rest)
+    fail(USAGE)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

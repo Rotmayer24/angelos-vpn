@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!-- angelOS: the VPN TUN helper and its installer.
+
+     org.angelos.vpn.helper   — the tunnel itself (up/down/status/diag). After the one-time
+     install the active session may use it without a password: it takes only numbers, one
+     host name and two comma-separated lists, and builds the sing-box config itself, so no
+     caller-supplied configuration ever reaches root.
+
+     org.angelos.vpn.install  — installing or removing the helper. Always asks for the
+     password: it runs as root over the plugin's files, and that is exactly the moment the
+     user wants to see what was asked. The path is the root-owned copy of the installer, not
+     the plugin directory, so nothing can be swapped in between the prompt and the run. -->
+<policyconfig>
+  <vendor>angelOS</vendor>
+  <action id="org.angelos.vpn.helper">
+    <description>Bring the VPN tunnel up or down</description>
+    <description xml:lang="ru">Поднять или опустить VPN-туннель</description>
+    <message>angelOS wants to control the VPN tunnel</message>
+    <message xml:lang="ru">angelOS хочет управлять VPN-туннелем</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/angelos-vpn</annotate>
+  </action>
+  <action id="org.angelos.vpn.install">
+    <description>Install the angelOS VPN helper</description>
+    <description xml:lang="ru">Установить помощник VPN для angelOS</description>
+    <message>angelOS wants to install its VPN helper</message>
+    <message xml:lang="ru">angelOS хочет установить помощник VPN</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/angelos-vpn-install</annotate>
+  </action>
+</policyconfig>
