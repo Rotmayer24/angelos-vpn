@@ -316,6 +316,24 @@ function uriToXray(u) {
     return null;
 }
 
+// Protocols Xray actually implements. A subscription is remote input and can name anything;
+// the core is started with whatever the provider wrote, and an outbound it does not know
+// fails only at connect time — the plugin says "connected" and nothing works. That is worse
+// than not offering the server: hysteria (QUIC) belongs to sing-box, which this client uses
+// for the TUN, not to Xray, and every hysteria entry in a subscription is dead on arrival.
+var CORE_PROTOCOLS = ["vless", "vmess", "trojan", "shadowsocks", "socks", "http", "wireguard", "dns", "freedom", "blackhole", "loopback"];
+
+function coreCanRun(cfg) {
+    var obs = (cfg && cfg.outbounds) || [];
+    for (var i = 0; i < obs.length; i++) {
+        var ob = obs[i];
+        if (!ob || !ob.protocol) continue;
+        if (CORE_PROTOCOLS.indexOf(String(ob.protocol)) < 0)
+            return false;
+    }
+    return true;
+}
+
 function isXrayConfig(o) {
     return !!o && typeof o === "object" && (o.inbounds !== undefined || o.outbounds !== undefined);
 }
@@ -328,33 +346,50 @@ function parseSubscription(text) {
         try {
             var j = JSON.parse(t);
             var arr = (j instanceof Array) ? j : [j];
-            var cfgs = arr.filter(isXrayConfig);
+            var usable = arr.filter(isXrayConfig);
+            var cfgs = usable.filter(coreCanRun);
             if (cfgs.length)
                 return { configs: cfgs, unsupported: arr.length - cfgs.length, kind: "json", error: "" };
+            // Parsed fine, but nothing in it can run on this client. Say that instead of
+            // falling through to the base64 branch and blaming the encoding.
+            if (usable.length)
+                return { configs: [], unsupported: usable.length, kind: "unsupported", error: "" };
         } catch (e) {
             // It looked like JSON and was not. Say so instead of quietly falling through to
             // base64 and reporting an empty list, which told the user nothing.
             return { configs: [], unsupported: 0, kind: "json-error", error: String(e && e.message || e) };
         }
     }
-    var dec = b64decode(t);
-    if (dec === null)
-        return { configs: [], unsupported: 0, kind: "bad-base64", error: "not base64" };
-    if (dec && dec.indexOf("://") >= 0) {
-        var lines = dec.split(/\r?\n/);
+    // A plain list of links is a valid subscription too — plenty of providers serve it
+    // unencoded. The "://" test has to run against the raw body, not against the decoded
+    // one: otherwise those subscriptions never reach the link parser and the user gets
+    // "not base64" with an empty server list, which is exactly what they report when a
+    // provider switches to plain text.
+    var body = null, kindName = "base64";
+    if (t && t.indexOf("://") >= 0) {
+        body = t;
+        kindName = "links";
+    } else {
+        var dec = b64decode(t);
+        if (dec === null)
+            return { configs: [], unsupported: 0, kind: "bad-base64", error: "not base64" };
+        body = dec;
+    }
+    if (body && body.indexOf("://") >= 0) {
+        var lines = body.split(/\r?\n/);
         var out = [], uns = 0;
         for (var i = 0; i < lines.length; i++) {
             var line = lines[i].trim();
             if (!line)
                 continue;
             var c = uriToXray(line);
-            if (c)
+            if (c && coreCanRun(c))
                 out.push(c);
             else
                 uns++;
         }
         if (out.length)
-            return { configs: out, unsupported: uns, kind: "base64", error: "" };
+            return { configs: out, unsupported: uns, kind: kindName, error: "" };
         return { configs: [], unsupported: uns, kind: "empty-list", error: "" };
     }
     return { configs: [], unsupported: 0, kind: "unknown", error: "" };

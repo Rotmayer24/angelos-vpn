@@ -35,7 +35,8 @@ PageSplit.qml PageSubscriptions.qml
 Subscriptions.js Fmt.js
 probe.py findbins.py fetch.sh
 privileged/angelos-vpn privileged/install.sh privileged/org.angelos.vpn.policy
-test/test_probe.py test/probe_deadline.py test/test_subscriptions.js"
+test/test_probe.py test/probe_deadline.py test/test_subscriptions.js
+  test/protocol_matrix.js"
 
 for f in $files; do
     [ -f "$f" ] || { echo "missing: $f" >&2; exit 1; }

@@ -9,7 +9,7 @@ let src = fs.readFileSync(path.join(here, '..', 'Subscriptions.js'), 'utf8');
 src = src.replace('.pragma library', '');
 const names = ['b64decode', 'utf8', 'parseQuery', 'hostPort', 'splitHead', 'baseInbounds',
     'streamFromQuery', 'vlessUri', 'vmessUri', 'trojanUri', 'decodeUserInfo',
-    'ssUri', 'uriToXray', 'isXrayConfig', 'parseSubscription', 'normalize',
+    'ssUri', 'uriToXray', 'isXrayConfig', 'coreCanRun', 'parseSubscription', 'normalize',
     'serverInfo', 'parseUserInfo'];
 const mod = new Function(src + '\nreturn {' + names.join(',') + '};')();
 
@@ -53,6 +53,17 @@ check(mod.parseSubscription('').kind === 'empty', 'empty body stays "empty"');
 check(mod.parseSubscription('$$$ not base64 $$$').kind === 'bad-base64', 'junk is "bad-base64"');
 const ok = mod.parseSubscription(b64('vless://11111111-1111-1111-1111-111111111111@a.example:443?type=tcp#n'));
 check(ok.kind === 'base64' && ok.configs.length === 1, 'a good subscription still parses');
+
+// Providers serve either encoding. Testing only the base64 form hid the plain one: the
+// "://" test ran after decoding, so an unencoded list came back as "not base64" with zero
+// servers and the user was told their subscription was broken.
+const plainList = mod.parseSubscription([
+    'vless://11111111-1111-1111-1111-111111111111@a.example:443?type=tcp#one',
+    'trojan://pw@b.example:443?security=tls#two'].join('\n'));
+check(plainList.configs.length === 2, 'an unencoded link list parses (was "bad-base64", 0 servers)');
+check(plainList.kind === 'links', 'and says so, rather than claiming base64');
+check(mod.parseSubscription(b64('vless://11111111-1111-1111-1111-111111111111@a.example:443?type=tcp#n')).kind === 'base64',
+    'the encoded form still reports base64');
 
 console.log("5) ss:// understands the SIP002 literal-userinfo form");
 const sip = mod.ssUri('ss://aes-256-gcm:secret%20pass@a.example:8388#node');
@@ -100,6 +111,26 @@ const t = mod.trojanUri('trojan://pw@a.example:443?security=tls#n');
 check(t && t.outbounds[0].settings.servers[0].password === 'pw', 'trojan parses');
 const ui = mod.parseUserInfo('upload=1; download=2; total=3; expire=4');
 check(ui.download === 2 && ui.expire === 4, 'subscription-userinfo parses');
+
+console.log("8) a protocol the core cannot run is not offered as a server");
+const withHysteria = JSON.stringify([{
+    inbounds: [], outbounds: [
+        { tag: 'proxy', protocol: 'hysteria', settings: { address: 'h.example', port: 443 } },
+        { tag: 'direct', protocol: 'freedom' }]
+}]);
+const hres = mod.parseSubscription(withHysteria);
+check(hres.configs.length === 0, 'a hysteria-only subscription yields no servers');
+check(hres.unsupported === 1, 'and is counted as unsupported (the UI says how many)');
+
+const mixed = mod.parseSubscription(JSON.stringify([
+    { inbounds: [], outbounds: [{ tag: 'proxy', protocol: 'vless', settings: { vnext: [{ address: 'a.example', port: 443 }] } }] },
+    { inbounds: [], outbounds: [{ tag: 'proxy', protocol: 'hysteria', settings: { address: 'h.example', port: 443 } }] }
+]));
+check(mixed.configs.length === 1 && mixed.unsupported === 1, 'a mixed subscription keeps only what runs');
+check(mod.coreCanRun({ outbounds: [{ protocol: 'trojan' }] }), 'trojan is allowed');
+check(!mod.coreCanRun({ outbounds: [{ protocol: 'hysteria' }] }), 'hysteria is refused');
+check(mod.coreCanRun({ outbounds: [{ protocol: 'vless' }, { protocol: 'freedom' }] }),
+    'a normal proxy + freedom pair is allowed');
 
 console.log();
 console.log(fails.length ? 'FAILURES: ' + fails.length : 'all checks passed');

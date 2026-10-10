@@ -831,20 +831,26 @@ gsettings set org.gnome.system.proxy.https port " + g(6, "443") + " 2>/dev/null;
         // The stats API port is socks + 1000, so a socks port near the top of the range
         // pushed it past 65535 and Xray died at connect time with a message that pointed
         // nowhere. Reject here instead, in the one place every path goes through.
-        if (!validPortFor(socks) || !validPortFor(http)) {
+        // Parse once and keep the numbers: validPortFor() parses internally, so validating
+        // the raw string and then storing it let "11080abc" through — it became 11080 for
+        // the check and stayed "11080abc" in the field, which the helper rejected at connect
+        // time. That is the same late failure this validation exists to prevent.
+        var sp = parseInt(socks, 10), hp = parseInt(http, 10);
+        if (!validPortFor(sp) || !validPortFor(hp)
+                || String(sp) !== String(socks).trim() || String(hp) !== String(http).trim()) {
             message = tr("Порты должны быть от 1024 до 64535 (для порта статистики +1000)", "Ports must be 1024–64535 (the stats port is socks + 1000)");
             log("rejected ports: socks=" + socks + " http=" + http);
             return false;
         }
-        if (socks === http) {
+        if (sp === hp) {
             message = tr("Порты SOCKS и HTTP должны различаться", "The SOCKS and HTTP ports must differ");
-            log("rejected identical ports: " + socks);
+            log("rejected identical ports: " + sp);
             return false;
         }
-        socksPort = socks;
-        httpPort = http;
-        put("socksPort", socks);
-        put("httpPort", http);
+        socksPort = sp;
+        httpPort = hp;
+        put("socksPort", sp);
+        put("httpPort", hp);
         return true;
     }
     // leaves room for the derived api port and stays clear of the privileged range
@@ -999,6 +1005,9 @@ gsettings set org.gnome.system.proxy.https port " + g(6, "443") + " 2>/dev/null;
                     why = root.tr(": это не base64 и не JSON", ": neither base64 nor JSON");
                 else if (res.kind === "empty-list")
                     why = root.tr(": список ссылок пуст", ": the link list is empty");
+                else if (res.kind === "unsupported")
+                    why = root.tr(": серверы используют протоколы, которых нет в этом клиенте",
+                                   ": the servers use protocols this client does not have");
                 root.message = root.tr("Подписка не распознана", "Subscription not recognized") + why + (res.unsupported ? " (" + res.unsupported + ")" : "");
                 root.log("subscription not recognized: kind=" + res.kind + (res.error ? " " + res.error : ""));
                 return;
