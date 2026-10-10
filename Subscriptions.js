@@ -319,9 +319,11 @@ function uriToXray(u) {
 // Protocols Xray actually implements. A subscription is remote input and can name anything;
 // the core is started with whatever the provider wrote, and an outbound it does not know
 // fails only at connect time — the plugin says "connected" and nothing works. That is worse
-// than not offering the server: hysteria (QUIC) belongs to sing-box, which this client uses
-// for the TUN, not to Xray, and every hysteria entry in a subscription is dead on arrival.
-var CORE_PROTOCOLS = ["vless", "vmess", "trojan", "shadowsocks", "socks", "http", "wireguard", "dns", "freedom", "blackhole", "loopback"];
+// than not offering the server. Hysteria (protocol "hysteria", version 2) belongs here since
+// the engine learned it: the provider's entries arrive as complete configs with
+// hysteriaSettings and a finalmask/salamander wrapper, and xray run -test validates them
+// like any other outbound (test/protocol_matrix.js checks that on every run).
+var CORE_PROTOCOLS = ["vless", "vmess", "trojan", "shadowsocks", "hysteria", "socks", "http", "wireguard", "dns", "freedom", "blackhole", "loopback"];
 
 function coreCanRun(cfg) {
     var obs = (cfg && cfg.outbounds) || [];
@@ -342,14 +344,38 @@ function parseSubscription(text) {
     var t = String(text || "").trim();
     if (!t)
         return { configs: [], unsupported: 0, kind: "empty", error: "" };
+    // The body arrives in three wrappings: raw JSON, a raw list of links, or base64 around
+    // either. Strip the wrapper once, then branch on the shape — the old order ran the JSON
+    // branch on the raw text only, so a base64-wrapped config list fell through to the link
+    // parser and came back "unknown".
+    var body = null, kindName = "base64";
     if (t.charAt(0) === "[" || t.charAt(0) === "{") {
+        body = t;
+        kindName = "json";
+    } else if (t && t.indexOf("://") >= 0) {
+        // A plain list of links is a valid subscription too — plenty of providers serve it
+        // unencoded. The "://" test has to run against the raw body, not against the decoded
+        // one: otherwise those subscriptions never reach the link parser and the user gets
+        // "not base64" with an empty server list, which is exactly what they report when a
+        // provider switches to plain text.
+        body = t;
+        kindName = "links";
+    } else {
+        var dec = b64decode(t);
+        if (dec === null)
+            return { configs: [], unsupported: 0, kind: "bad-base64", error: "not base64" };
+        body = dec;
+        if (body.charAt(0) === "[" || body.charAt(0) === "{")
+            kindName = "json";
+    }
+    if (body.charAt(0) === "[" || body.charAt(0) === "{") {
         try {
-            var j = JSON.parse(t);
+            var j = JSON.parse(body);
             var arr = (j instanceof Array) ? j : [j];
             var usable = arr.filter(isXrayConfig);
             var cfgs = usable.filter(coreCanRun);
             if (cfgs.length)
-                return { configs: cfgs, unsupported: arr.length - cfgs.length, kind: "json", error: "" };
+                return { configs: cfgs, unsupported: arr.length - cfgs.length, kind: kindName, error: "" };
             // Parsed fine, but nothing in it can run on this client. Say that instead of
             // falling through to the base64 branch and blaming the encoding.
             if (usable.length)
@@ -359,21 +385,6 @@ function parseSubscription(text) {
             // base64 and reporting an empty list, which told the user nothing.
             return { configs: [], unsupported: 0, kind: "json-error", error: String(e && e.message || e) };
         }
-    }
-    // A plain list of links is a valid subscription too — plenty of providers serve it
-    // unencoded. The "://" test has to run against the raw body, not against the decoded
-    // one: otherwise those subscriptions never reach the link parser and the user gets
-    // "not base64" with an empty server list, which is exactly what they report when a
-    // provider switches to plain text.
-    var body = null, kindName = "base64";
-    if (t && t.indexOf("://") >= 0) {
-        body = t;
-        kindName = "links";
-    } else {
-        var dec = b64decode(t);
-        if (dec === null)
-            return { configs: [], unsupported: 0, kind: "bad-base64", error: "not base64" };
-        body = dec;
     }
     if (body && body.indexOf("://") >= 0) {
         var lines = body.split(/\r?\n/);
@@ -423,7 +434,7 @@ function serverInfo(cfg, index) {
         protocol: ob.protocol || "?",
         host: host || "",
         port: port || 0,
-        network: net || (ob.protocol === "hysteria" ? "quic" : "tcp"),
+        network: net || "tcp",
         ping: -1
     };
 }

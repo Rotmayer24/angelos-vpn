@@ -11,8 +11,10 @@
 # It takes only validated numbers, one host name and two comma-separated lists, builds the
 # sing-box configuration itself and runs it: a TUN interface that sends everything to the
 # local Xray SOCKS port, except the Xray process itself (its link to the server), private
-# networks and the app / domain lists the user chose. No caller-supplied configuration is
-# ever passed to sing-box.
+# networks and the app / domain lists the user chose. UDP 443 (QUIC) is refused instead of
+# tunneled: it cannot cross either transport, and an unanswered attempt makes browsers hang
+# instead of falling back to TCP. No caller-supplied configuration is ever passed to
+# sing-box.
 import json
 import os
 import re
@@ -208,6 +210,13 @@ def build_config(socks, api, host, dns, apps, domains, kill):
         rules.append({"domain_suffix": domains, "outbound": "direct"})
     if apps:
         rules.append({"process_name": apps, "outbound": "direct"})
+    # QUIC (UDP 443) cannot cross this tunnel on either transport: the provider breaks it
+    # through XHTTP, and QUIC-in-QUIC through hysteria fails at the handshake. Left alone,
+    # a browser keeps ringing the dead door and the page appears to hang while plain TCP
+    # would have loaded it through the tunnel. Answer UDP 443 with port-unreachable AFTER
+    # the direct exemptions above, so browsers fall back to TCP at once and apps marked
+    # direct keep their QUIC on the physical interface.
+    rules.append({"port": 443, "network": "udp", "action": "reject"})
     return {
         "log": {"level": "info", "timestamp": True, "output": LOGFILE},
         "dns": {

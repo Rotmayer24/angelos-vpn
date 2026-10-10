@@ -112,23 +112,45 @@ check(t && t.outbounds[0].settings.servers[0].password === 'pw', 'trojan parses'
 const ui = mod.parseUserInfo('upload=1; download=2; total=3; expire=4');
 check(ui.download === 2 && ui.expire === 4, 'subscription-userinfo parses');
 
-console.log("8) a protocol the core cannot run is not offered as a server");
-const withHysteria = JSON.stringify([{
+console.log("8) hysteria rides the same pipeline as the Xray protocols");
+// The engine runs hysteria natively (protocol "hysteria", version 2): the provider's
+// entries are complete configs with hysteriaSettings and a finalmask/salamander wrapper,
+// and the core validates them like vless. Cutting them used to hide 4 of the provider's
+// 23 servers. A protocol the core genuinely lacks must still be refused.
+const hyConfig = {
     inbounds: [], outbounds: [
-        { tag: 'proxy', protocol: 'hysteria', settings: { address: 'h.example', port: 443 } },
+        { tag: 'proxy', protocol: 'hysteria',
+          settings: { address: 'h.example', port: 443, version: 2 },
+          streamSettings: { network: 'hysteria',
+              hysteriaSettings: { version: 2, auth: 'hy2-pass' },
+              security: 'tls',
+              tlsSettings: { serverName: 'h.example', alpn: ['h3'] },
+              finalmask: { udp: [{ type: 'salamander', settings: { password: 'obfs-pass' } }] } } },
         { tag: 'direct', protocol: 'freedom' }]
-}]);
-const hres = mod.parseSubscription(withHysteria);
-check(hres.configs.length === 0, 'a hysteria-only subscription yields no servers');
-check(hres.unsupported === 1, 'and is counted as unsupported (the UI says how many)');
+};
+const hres = mod.parseSubscription(JSON.stringify([hyConfig]));
+check(hres.configs.length === 1, 'a hysteria-only subscription yields its server');
+check(hres.unsupported === 0, 'and is not counted as unsupported');
+check(mod.parseSubscription(b64(JSON.stringify([hyConfig]))).configs.length === 1,
+    'a base64-wrapped JSON subscription parses too (the wrapper is stripped before branching)');
+if (hres.configs.length) {
+    const hinfo = mod.serverInfo(hres.configs[0], 0);
+    check(hinfo.host === 'h.example' && hinfo.port === 443, 'serverInfo reads address/port');
+    check(hinfo.network === 'hysteria', 'the transport name survives into the server entry');
+    check(hres.configs[0].outbounds[0].streamSettings.hysteriaSettings.auth === 'hy2-pass',
+        'the auth secret passes through untouched');
+    check(!!hres.configs[0].outbounds[0].streamSettings.finalmask,
+        'the finalmask wrapper passes through untouched');
+}
 
 const mixed = mod.parseSubscription(JSON.stringify([
     { inbounds: [], outbounds: [{ tag: 'proxy', protocol: 'vless', settings: { vnext: [{ address: 'a.example', port: 443 }] } }] },
-    { inbounds: [], outbounds: [{ tag: 'proxy', protocol: 'hysteria', settings: { address: 'h.example', port: 443 } }] }
+    hyConfig
 ]));
-check(mixed.configs.length === 1 && mixed.unsupported === 1, 'a mixed subscription keeps only what runs');
+check(mixed.configs.length === 2 && mixed.unsupported === 0, 'a mixed subscription keeps every server');
 check(mod.coreCanRun({ outbounds: [{ protocol: 'trojan' }] }), 'trojan is allowed');
-check(!mod.coreCanRun({ outbounds: [{ protocol: 'hysteria' }] }), 'hysteria is refused');
+check(mod.coreCanRun({ outbounds: [{ protocol: 'hysteria' }] }), 'hysteria is allowed');
+check(!mod.coreCanRun({ outbounds: [{ protocol: 'tuic' }] }), 'a protocol the core lacks is still refused');
 check(mod.coreCanRun({ outbounds: [{ protocol: 'vless' }, { protocol: 'freedom' }] }),
     'a normal proxy + freedom pair is allowed');
 

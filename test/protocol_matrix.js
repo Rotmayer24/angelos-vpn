@@ -22,13 +22,27 @@ function xray() {
   return candidates[0];
 }
 
-// One representative link per protocol the parser claims to support.
+// One representative subscription body per protocol the parser claims to support: a URI
+// link where the protocol has one, a JSON config where the provider serves one — hysteria
+// comes only in the Xray-config form, never as a URI.
 const links = {
   vless: 'vless://11111111-2222-3333-4444-555555555555@ex.example:443?encryption=none&security=tls&sni=ex.example&type=xhttp&path=%2Fapi%2Fv1&host=ex.example#vless-xhttp',
   vmess: 'vmess://eyJ2IjoiMiIsInBzIjoidm1lc3MtYmFzZS02NG1kIiwiYWRkIjoiZXguZXhhbXBsZSIsInBvcnQiOjQ0MywiaWQiOiJhYmMifQ',
   trojan: 'trojan://p%40ss%3Aword@ex.example:443?security=tls&sni=ex.example&type=tcp#trojan-tcp',
   ss: 'ss://YWVzLTI1Ni1nY206c2VjcmV0K3Bhc3M@ex.example:8388#ss-legacy',
-  hysteria: null,
+  hysteria: JSON.stringify([{
+    inbounds: [],
+    outbounds: [
+      { tag: 'proxy', protocol: 'hysteria',
+        settings: { address: 'ex.example', port: 443, version: 2 },
+        streamSettings: { network: 'hysteria',
+          hysteriaSettings: { version: 2, auth: 'probe-password' },
+          security: 'tls',
+          tlsSettings: { serverName: 'ex.example', fingerprint: 'chrome', alpn: ['h3'] },
+          finalmask: { udp: [{ type: 'salamander', settings: { password: 'obfs-pass' } }] } } },
+      { tag: 'direct', protocol: 'freedom' }
+    ]
+  }]),
 };
 
 const out = [];

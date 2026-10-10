@@ -77,6 +77,11 @@ The generated tunnel:
 - hijacks **only port 53** for DNS and sends those queries through the proxy;
 - sends your chosen apps (by process name) and domains (suffixes) directly, when
   split tunneling is on;
+- refuses **UDP 443** (QUIC): it cannot cross either transport — the provider
+  breaks it through XHTTP and QUIC-in-QUIC through hysteria fails at the
+  handshake — and an unanswered attempt makes a browser hang instead of falling
+  back, so pages load over TCP immediately. Apps and domains marked direct keep
+  their QUIC on the physical interface;
 - everything else goes to Xray's SOCKS port;
 - **Kill switch** (`strict_route`) blocks leaks if the tunnel drops.
 
@@ -116,11 +121,10 @@ down. Typical case: about two seconds, no reboot.
 - a **base64 list** of `vless://` / `vmess://` / `trojan://` / `ss://` URIs,
   including the SIP002 `ss://method:pass@host:port` form.
 
-Either way every server ends up as one Xray config, so a single engine runs them
-all. The request carries `X-HWID` (see below) and the `v2rayNG/1.8.5`
-User-Agent. A link the engine could not run (an unknown transport, reality
-without a public key) is reported as unsupported rather than listed as a server
-that fails at connect time.
+Hysteria2 servers arrive inside the Xray-config form and run on the same
+engine: recent Xray-core speaks the protocol natively, salamander obfuscation
+included. A protocol the engine genuinely lacks is reported as unsupported
+rather than listed as a server that fails at connect time.
 
 The URL carries a secret, so it is masked in the UI and only revealed on demand.
 
@@ -175,11 +179,22 @@ which also takes a running tunnel down.
 
 ## Tests
 
-Two test suites run offline, without touching the network:
+Five suites run offline, without touching the network:
 
 ```sh
 python3 test/test_probe.py     # the ping probe: argument handling and the deadline
 node    test/test_subscriptions.js   # the parser, against hostile and modern inputs
+node    test/protocol_matrix.js      # every protocol, validated by `xray run -test`
+python3 test/probe_deadline.py       # the probe's deadline under a wedged resolver
+python3 test/test_helper_config.py   # the TUN helper's config: rule order + `sing-box check`
+```
+
+A sixth lives in the repository but not in the release archive, because it reaches the
+provider's servers on purpose — it answers "does this server actually carry traffic", which
+`xray run -test` cannot:
+
+```sh
+python3 test/test_all_servers.py 3 6   # every server in the active subscription, live
 ```
 
 ## License

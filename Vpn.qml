@@ -194,7 +194,9 @@ Singleton {
     property double _lastDown: 0
     property double _lastStatsAt: 0
     property bool _stopping: false
+    property bool _stopToOff: false
     property bool _reconnect: false
+    property bool _queuedConnect: false
     property bool _tunDownQuiet: false
     property bool _autoPending: false
     property bool _needHwid: false
@@ -426,8 +428,18 @@ Singleton {
     // ---- connect / disconnect -------------------------------------------------
     function connect() {
         log("connect request: mode=" + mode + " status=" + status + " server=" + currentName);
-        if (status === "on" || status === "connecting")
+        if (status === "on" || status === "connecting") {
+            // A stop may be in flight: the core has been asked to die but has not exited yet,
+            // so the status still reads "on". Dropping the request here left the user with an
+            // enabled-looking VPN that silently did nothing — queue it for finishStop().
+            // _stopping covers the proxy-mode window where coreProc is no longer "running"
+            // but the process has not reported its exit yet.
+            if (status === "on" && (coreProc.running || downProc.running || _stopping)) {
+                _queuedConnect = true;
+                message = tr("Переподключаюсь…", "Reconnecting…");
+            }
             return;
+        }
         if (!servers.length) {
             if (activeSub)
                 refresh();
@@ -491,9 +503,18 @@ Singleton {
         readyTimer.running = false;
         statsTimer.running = false;
         if (coreProc.running) {
+            // "off" used to be set right here, before the core was actually gone, and the
+            // deferred connect() then started on a dying process — a tunnel that never came
+            // up while the UI looked fine. The stop completes when the process really exits
+            // (coreProc.onExited); only then may the next one start.
             _stopping = true;
+            _stopToOff = true;
             coreProc.running = false;
+            return;
         }
+        finishStop();
+    }
+    function finishStop() {
         status = "off";
         message = "";
         upSpeed = 0;
@@ -501,6 +522,10 @@ Singleton {
         applySystemProxy(false);
         if (_reconnect) {
             _reconnect = false;
+            Qt.callLater(connect);
+        }
+        if (_queuedConnect) {
+            _queuedConnect = false;
             Qt.callLater(connect);
         }
     }
@@ -521,8 +546,10 @@ Singleton {
     // the emergency brake: stop everything at once, no matter what state we are in
     function forceOff() {
         _reconnect = false;
+        _queuedConnect = false;
         _autoPending = false;
         _stopping = false;
+        _stopToOff = false;
         readyTimer.running = false;
         statsTimer.running = false;
         helperPoll.running = false;
@@ -1137,6 +1164,10 @@ gsettings set org.gnome.system.proxy.https port " + g(6, "443") + " 2>/dev/null;
             readyTimer.running = false;
             if (root._stopping) {
                 root._stopping = false;
+                if (root._stopToOff) {
+                    root._stopToOff = false;
+                    root.finishStop();
+                }
                 return;
             }
             if (root.status === "on" || root.status === "connecting") {
