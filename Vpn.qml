@@ -141,6 +141,10 @@ Singleton {
     }
     readonly property string cacheDir: (Quickshell.env("XDG_CACHE_HOME") || (Quickshell.env("HOME") + "/.cache")) + "/angelos-vpn"
     readonly property string runPath: cacheDir + "/run.json"
+    // Hysteria credentials, written 0600 and handed to the helper as a path rather than in
+    // argv: argv is world-readable through /proc for as long as the tunnel is up, and this
+    // password is the whole of the server's authentication.
+    readonly property string hyCredPath: cacheDir + "/hysteria.json"
     readonly property string probePath: plugDir + "probe.py"
     readonly property string assetDir: xrayPath.substring(0, xrayPath.lastIndexOf("/"))
 
@@ -211,6 +215,9 @@ Singleton {
     property string fetchSubId: ""
     property string fetchPhase: ""
     property string _writeData: ""
+    // the Hysteria credentials being written for the helper, kept apart from _writeData so a
+    // subscription refresh landing at the same moment cannot clobber the file mid-connect
+    property string _hyCredData: ""
     // the subscription body being written to the cache (kept apart from _writeData, which
     // belongs to the run config)
     property string _subData: ""
@@ -465,6 +472,14 @@ Singleton {
         return p < 65535 ? p : start;
     }
     function beginConnect() {
+        // Hysteria runs on sing-box itself, so in TUN mode there is no core to start at all:
+        // the helper brings up the tunnel with the Hysteria outbound already wired in. Starting
+        // Xray as well would leave a second process holding the same port range, and its own
+        // connection to the server would be captured by the tunnel it is meant to serve.
+        if (mode === "tun" && (currentServer || {}).engine === "sing-box") {
+            writeHyCreds();
+            return;
+        }
         var cfg = Sub.normalize(_configs[selectedIndex], {
             "socksPort": socksPort,
             "httpPort": httpPort,
@@ -580,10 +595,22 @@ Singleton {
     }
     // the core died while the TUN is up: take the TUN down, keep the error status
     function teardownTun() {
+        dropHyCreds();
         if (mode === "tun" && !downProc.running) {
             _tunDownQuiet = true;
             downProc.running = true;
         }
+    }
+    // The helper deletes this file the moment it reads it, but a connect that fails before it
+    // gets that far — a cancelled pkexec prompt, a bad password — would otherwise leave the
+    // server's only credential sitting in the cache directory.
+    function dropHyCreds() {
+        if (hyCredWrite.running) {
+            hyCredWrite.running = false;
+            return;
+        }
+        hyCredRemove.command = ["rm", "-f", hyCredPath];
+        hyCredRemove.running = true;
     }
 
     // The shell is going away gracefully (a session logout, a plugin reload). The helper's
@@ -641,16 +668,43 @@ Singleton {
         else
             finalizeOn();
     }
+    function writeHyCreds() {
+        var s = currentServer || {};
+        var hy = s.hy || {};
+        if (!hy.password) {
+            fail(tr("У сервера нет пароля Hysteria — подключиться нечем.",
+                    "This server has no Hysteria password — there is nothing to connect with."));
+            return;
+        }
+        _hyCredData = JSON.stringify({
+            server: s.host || "",
+            port: s.port || 443,
+            password: hy.password,
+            sni: hy.sni || "",
+            insecure: !!hy.insecure,
+            obfsPw: hy.obfsPw || ""
+        });
+        message = tr("Готовлю Hysteria…", "Preparing Hysteria…");
+        hyCredWrite.command = ["sh", "-c", "umask 077; printf %s \"$1\" > \"$2\"",
+                               "sh", _hyCredData, hyCredPath];
+        hyCredWrite.running = true;
+    }
     function helperUp() {
         var s = currentServer || {};
         message = tr("Поднимаю TUN…", "Bringing up the TUN…");
-        upProc.command = ["pkexec", helperPath, "up",
+        var args = ["pkexec", helperPath, "up",
             String(socksPort), String(apiPort), (s.host || ""), dns,
             (splitOn ? directApps.join(",") : ""),
             (splitOn ? directDomains.join(",") : ""),
             (killSwitch ? "1" : "0"),
             // where findbins.py located sing-box; the helper validates it before running it
             (singBoxPath || "")];
+        // The ninth argument exists only for Hysteria: the helper treats the file as the
+        // instruction to build a sing-box config with a Hysteria outbound instead of Xray,
+        // and deletes the file as soon as it has read it.
+        if ((s.engine || "xray") === "sing-box")
+            args.push(hyCredPath);
+        upProc.command = args;
         upProc.running = true;
     }
 
@@ -667,6 +721,13 @@ Singleton {
 
     // ---- traffic stats --------------------------------------------------------
     function startStats() {
+        // The counters come from Xray's own API, and a Hysteria connection has no Xray: the
+        // process would exit non-zero on every tick and leave the panel showing a permanent
+        // error over a tunnel that is working. Show nothing rather than something false.
+        if ((currentServer || {}).engine === "sing-box") {
+            statsTimer.running = false;
+            return;
+        }
         _lastStatsAt = 0;
         statsTimer.running = true;
         if (!statsProc.running)
@@ -1140,6 +1201,18 @@ gsettings set org.gnome.system.proxy.https port " + g(6, "443") + " 2>/dev/null;
     }
 
     Process {
+        id: hyCredWrite
+        onExited: code => {
+            if (code !== 0) {
+                root.fail(root.tr("Не удалось записать учётные данные Hysteria",
+                                  "Could not write the Hysteria credentials"));
+                return;
+            }
+            root.helperUp();
+        }
+    }
+
+    Process {
         id: coreProc
         command: [root.xrayPath, "run", "-c", root.runPath]
         environment: ({
@@ -1268,7 +1341,10 @@ gsettings set org.gnome.system.proxy.https port " + g(6, "443") + " 2>/dev/null;
                 // where to put the binary
                 root.fail(root.tr("Не найден sing-box — TUN-режим не может работать. Поставь его или используй режим прокси.",
                     "sing-box not found — TUN mode cannot work. Install it, or use proxy mode."));
-            } else if (root.missingBins.indexOf("xray") >= 0) {
+            } else if (root.missingBins.indexOf("xray") >= 0
+                       && ((root.currentServer || {}).engine || "xray") !== "sing-box") {
+                // only worth saying when Xray is the engine that was actually needed; a
+                // Hysteria server runs on sing-box, so a missing Xray is not its problem
                 root.fail(root.tr("Не найден Xray — подключиться нечем. Поставь Xray-core или добавь его в PATH.",
                     "Xray not found — there is nothing to connect with. Install Xray-core or put it in PATH."));
             } else {
@@ -1276,6 +1352,10 @@ gsettings set org.gnome.system.proxy.https port " + g(6, "443") + " 2>/dev/null;
                 root.fail(root.tr("TUN не поднялся", "TUN failed") + " (pkexec " + code + ")" + (root.helperInstalled ? (why ? ": " + why : "") : root.tr(": установи помощника", ": install the helper")));
             }
         }
+    }
+
+    Process {
+        id: hyCredRemove
     }
 
     Process {

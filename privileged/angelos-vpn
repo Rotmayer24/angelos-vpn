@@ -35,7 +35,7 @@ PIDFILE = os.path.join(RUNDIR, "sing-box.pid")
 LOGFILE = os.path.join(RUNDIR, "sing-box.log")
 
 USAGE = ("usage: angelos-vpn up <socksPort> <apiPort> <host> <dns> <appsCsv> <domainsCsv> "
-         "<killSwitch> [<singBoxPath>] | down | status | diag [host] | guard")
+         "<killSwitch> [<singBoxPath>] [<hyCredentialsFile>] | down | status | diag [host] | guard")
 
 
 def fail(msg, code=2):
@@ -194,7 +194,76 @@ def tun_address():
     return "172.30.0.1/30"
 
 
-def build_config(socks, api, host, dns, apps, domains, kill):
+def build_config(socks, api, host, dns, apps, domains, kill, hy=None):
+    # Hysteria mode: sing-box is both the tunnel and the proxy, so no Xray runs at all and
+    # nothing listens on the SOCKS/HTTP ports — every packet comes straight off the TUN into
+    # the Hysteria2 outbound. `hy` is the credential dict the plugin wrote to a file we can
+    # read as root; the password is deliberately not passed in argv, where any local process
+    # could read it out of /proc.
+    if hy is not None:
+        rules = []
+        for ip in resolve_v4(hy["server"]):
+            rules.append({"ip_cidr": [ip + "/32"], "outbound": "direct"})
+        rules.append({"action": "hijack-dns", "port": 53})
+        rules.append({"ip_is_private": True, "outbound": "direct"})
+        if domains:
+            rules.append({"domain_suffix": domains, "outbound": "direct"})
+        if apps:
+            rules.append({"process_name": apps, "outbound": "direct"})
+        # QUIC-in-QUIC is what this transport already is; browser QUIC to anywhere else just
+        # rings the dead door, so answer it unreachable and let the browser fall back to TCP.
+        rules.append({"port": 443, "network": "udp", "action": "reject"})
+        tls = {"enabled": True, "insecure": bool(hy["insecure"])}
+        if hy["sni"]:
+            tls["server_name"] = hy["sni"]
+        return {
+            "log": {"level": "info", "timestamp": True, "output": LOGFILE},
+            "dns": {
+                "servers": [
+                    {"type": "udp", "tag": "remote", "server": dns, "detour": "proxy"},
+                    {"type": "local", "tag": "local"},
+                ],
+                # split-tunnel domains are looked up locally so their name never leaves via
+                # the remote resolver before the route rule sends them direct.
+                "rules": ([{"domain_suffix": domains, "server": "local"}] if domains else []),
+                "final": "remote",
+                "strategy": "ipv4_only",
+                "independent_cache": True,
+            },
+            "inbounds": [{
+                "type": "tun",
+                "tag": "tun-in",
+                "interface_name": pick_iface(),
+                "address": [tun_address()],
+                "mtu": 9000,
+                "auto_route": True,
+                "strict_route": bool(kill),
+                "stack": "gvisor",
+                "sniff": True,
+            }],
+            "outbounds": [
+                {
+                    "type": "hysteria2",
+                    "tag": "proxy",
+                    "server": hy["server"],
+                    "server_port": hy["port"],
+                    "password": hy["password"],
+                    "tls": tls,
+                    # Salamander is what the provider wraps the traffic in; without this
+                    # block the server treats the packets as junk and never answers.
+                    **({"obfs": {"type": "salamander",
+                                 "password": hy["obfsPw"]}} if hy.get("obfsPw") else {}),
+                },
+                {"type": "direct", "tag": "direct", "domain_resolver": "local"},
+            ],
+            "route": {
+                "rules": rules,
+                "final": "proxy",
+                "auto_detect_interface": True,
+                "default_domain_resolver": {"server": "local"},
+            },
+        }
+
     rules = [{"process_name": ["xray"], "outbound": "direct"}]
     for ip in resolve_v4(host):
         rules.append({"ip_cidr": [ip + "/32"], "outbound": "direct"})
@@ -315,8 +384,105 @@ def is_sing_box(pid):
     return os.path.basename(exe).startswith("sing-box")
 
 
+def caller_cache_dir():
+    """Where the plugin writes its cache, seen from the user who invoked us.
+
+    Under pkexec our own HOME is /root even though the file we have to read belongs to the
+    user sitting at the desktop. PKEXEC_UID names that user and is set by polkit rather than
+    by the caller, so it cannot be forged to point the lookup at another account.
+    """
+    uid = os.environ.get("PKEXEC_UID", "")
+    if uid.isdigit():
+        try:
+            import pwd
+            home = pwd.getpwuid(int(uid)).pw_dir
+        except (ImportError, KeyError):
+            fail("unknown PKEXEC_UID: " + uid)
+        # the caller's cache is under their own home; our XDG_CACHE_HOME is root's and ours
+        return os.path.join(home, ".cache", "angelos-vpn")
+    # no pkexec in the picture (a direct run, the tests): our own environment is the caller's
+    return os.path.join(os.environ.get("XDG_CACHE_HOME") or
+                        os.path.join(os.path.expanduser("~"), ".cache"), "angelos-vpn")
+
+
+def read_hy_file(path):
+    """The Hysteria credentials, from a file the plugin wrote rather than from argv.
+
+    Anything in argv is world-readable through /proc while the command runs, so the password
+    would belong to every process on the machine for as long as the tunnel was up. Here it
+    arrives through a 0600 file that is deleted as soon as this returns — but the file is
+    still user-written data read by a root process, so every field is treated as hostile:
+    the path must be absolute, short, and free of anything but a name and a parent directory
+    we expect, and the values are re-checked rather than trusted.
+    """
+    if not path:
+        return None
+    if not path.startswith("/") or len(path) > 4096 or "\0" in path or "\n" in path:
+        fail("bad credentials path")
+    # Keep the caller inside the plugin's own cache dir: a path to, say, /etc/shadow would
+    # otherwise be read by root and handed to sing-box as a "password".
+    #
+    # The home directory has to be the *caller's*, not ours: pkexec resets the environment, so
+    # HOME here is /root and the plugin's file lives in the user's cache. PKEXEC_UID is set by
+    # polkit itself in the environment of the process it starts, so unlike an argument it
+    # cannot be forged — which is exactly what makes it safe to look a home directory up from.
+    cache = caller_cache_dir()
+    if os.path.dirname(os.path.realpath(path)) != os.path.realpath(cache):
+        fail("credentials must live in " + cache)
+    try:
+        st = os.stat(path)
+    except OSError:
+        fail("credentials file not found: " + path)
+    if not stat.S_ISREG(st.st_mode):
+        fail("credentials file is not a regular file")
+    if st.st_mode & (stat.S_IROTH | stat.S_IWOTH):
+        fail("credentials file is readable by other users")
+    if st.st_size > 8192:
+        fail("credentials file is implausibly large")
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        fail("credentials file is not readable JSON")
+    if not isinstance(data, dict):
+        fail("credentials file is not an object")
+
+    def field(key, maxlen):
+        v = data.get(key, "")
+        if not isinstance(v, str) or len(v) > maxlen or "\0" in v:
+            fail("bad credentials field: " + key)
+        return v
+
+    server = valid_host(field("server", 255))
+    if not server:
+        fail("bad hysteria server")
+    port = data.get("port", 443)
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        fail("bad hysteria port")
+    password = field("password", 1024)
+    if not password:
+        fail("hysteria password required for sing-box engine")
+    sni = field("sni", 255)
+    if sni and not re.fullmatch(r"[A-Za-z0-9._-]+", sni):
+        fail("bad hysteria sni")
+    insecure = data.get("insecure", False)
+    if not isinstance(insecure, bool):
+        fail("bad hysteria insecure flag")
+    # Salamander obfuscation is a second secret the server may require; it is not optional
+    # when the provider sent one, and passing it on when the server expects none is harmless.
+    obfs_pw = field("obfsPw", 1024)
+
+    # best effort: the secret has served its purpose once it is in the config
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    return {"server": server, "port": port, "password": password,
+            "sni": sni, "insecure": insecure, "obfsPw": obfs_pw}
+
+
 def parse_up_args(argv):
-    if len(argv) not in (7, 8):
+    if len(argv) not in (7, 8, 9):
         fail(USAGE)
     socks = valid_port(argv[0])
     api = valid_port(argv[1])
@@ -332,13 +498,17 @@ def parse_up_args(argv):
     if dns is None:
         fail("bad dns")
     # optional: where sing-box actually is, since the plugin looks it up itself
-    sb = valid_singbox(argv[7] if len(argv) == 8 else "")
-    return socks, api, host, dns, apps, domains, kill, sb
+    sb = valid_singbox(argv[7] if len(argv) >= 8 else "")
+    # optional: a file holding the Hysteria credentials. Its presence is what selects the
+    # sing-box-only mode; every field is re-validated here because this runs as root and the
+    # file is written by the user.
+    hy = read_hy_file(argv[8] if len(argv) >= 9 else "")
+    return socks, api, host, dns, apps, domains, kill, sb, hy
 
 
 def cmd_up(argv):
-    socks, api, host, dns, apps, domains, kill, sb = parse_up_args(argv)
-    cfg = build_config(socks, api, host, dns, apps, domains, kill)
+    socks, api, host, dns, apps, domains, kill, sb, hy = parse_up_args(argv)
+    cfg = build_config(socks, api, host, dns, apps, domains, kill, hy)
     stop_running()
     os.makedirs(RUNDIR, mode=0o700, exist_ok=True)
     # makedirs leaves an existing directory's mode alone, so an older or pre-created

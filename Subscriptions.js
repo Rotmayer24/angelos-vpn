@@ -428,6 +428,20 @@ function serverInfo(cfg, index) {
         host = s.address; port = s.port;
     }
     var net = (ob.streamSettings && ob.streamSettings.network) || "";
+    // Hysteria2 rides on sing-box directly, so no Xray runs for it at all. The credentials
+    // are carried here rather than looked up later: the plugin hands them to the privileged
+    // helper through a 0600 file, and by then it only has the server entry, not the config.
+    var ss = ob.streamSettings || {};
+    var hs = ss.hysteriaSettings || {};
+    var tlsS = ss.tlsSettings || {};
+    // Salamander obfuscation is a second secret the provider may require; without it the
+    // server drops the handshake rather than answering.
+    var obfsPw = "";
+    var masks = (ss.finalmask && ss.finalmask.udp) || [];
+    for (var m = 0; m < masks.length; m++)
+        if (masks[m] && masks[m].type === "salamander")
+            obfsPw = (masks[m].settings && masks[m].settings.password) || "";
+    var engine = (ob.protocol === "hysteria") ? "sing-box" : "xray";
     return {
         index: index,
         name: (cfg && cfg.remarks) || (host ? host + ":" + port : ("#" + (index + 1))),
@@ -435,7 +449,14 @@ function serverInfo(cfg, index) {
         host: host || "",
         port: port || 0,
         network: net || "tcp",
-        ping: -1
+        ping: -1,
+        engine: engine,
+        hy: engine === "sing-box" ? {
+            password: String(hs.auth || ""),
+            sni: String(tlsS.serverName || ""),
+            insecure: !!tlsS.allowInsecure,
+            obfsPw: String(obfsPw)
+        } : null
     };
 }
 
