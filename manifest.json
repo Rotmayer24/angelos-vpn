@@ -1,11 +1,14 @@
 {
   "id": "vpn",
-  "name": { "ru": "VPN", "en": "VPN" },
-  "version": "1.1.0",
+  "name": {
+    "ru": "VPN",
+    "en": "VPN"
+  },
+  "version": "1.1.1",
   "author": "SugarJora",
   "description": {
-    "ru": "VPN-клиент на Xray: подписки, выбор локации, пинг серверов, раздельное туннелирование и TUN-режим с одним вводом пароля. Читает те же подписки, что Fortuna и Happ.",
-    "en": "An Xray VPN client: subscriptions, location picker, server ping, split tunneling and a TUN mode behind a one-time password. Reads the same subscriptions as Fortuna and Happ."
+    "ru": "VPN-клиент на Xray и sing-box: подписки, выбор локации, пинг серверов, раздельное туннелирование и TUN-режим с одним вводом пароля. Читает те же подписки, что Fortuna и Happ.",
+    "en": "A VPN client built on Xray and sing-box: subscriptions, location picker, server ping, split tunneling and a TUN mode behind a one-time password. Reads the same subscriptions as Fortuna and Happ."
   },
   "license": "MIT",
   "repository": "https://github.com/SugarJora/angelos-vpn",
@@ -17,10 +20,24 @@
   ],
   "icon": "lock",
   "enabledByDefault": true,
-  "themes": ["pixel", "mac"],
+  "themes": [
+    "pixel",
+    "mac"
+  ],
   "category": "Network",
-  "tags": ["vpn", "xray", "proxy", "fortuna", "happ", "network", "tun"],
-  "realms": ["heaven", "hell"],
+  "tags": [
+    "vpn",
+    "xray",
+    "proxy",
+    "fortuna",
+    "happ",
+    "network",
+    "tun"
+  ],
+  "realms": [
+    "heaven",
+    "hell"
+  ],
   "main": "Main.qml",
   "desktopTitle": "vpn",
   "desktopWidget": "DesktopWidget.qml",
@@ -30,14 +47,26 @@
   "achievements": [
     {
       "id": "first-connect",
-      "name": { "ru": "На связи", "en": "Connected" },
-      "desc": { "ru": "Впервые подключиться к серверу", "en": "Connect to a server for the first time" },
+      "name": {
+        "ru": "На связи",
+        "en": "Connected"
+      },
+      "desc": {
+        "ru": "Впервые подключиться к серверу",
+        "en": "Connect to a server for the first time"
+      },
       "icon": "bolt"
     },
     {
       "id": "tun",
-      "name": { "ru": "Глубокое погружение", "en": "Deep dive" },
-      "desc": { "ru": "Включить TUN-режим", "en": "Turn on TUN mode" },
+      "name": {
+        "ru": "Глубокое погружение",
+        "en": "Deep dive"
+      },
+      "desc": {
+        "ru": "Включить TUN-режим",
+        "en": "Turn on TUN mode"
+      },
       "icon": "lock"
     }
   ]

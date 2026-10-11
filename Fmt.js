@@ -21,7 +21,9 @@ function rate(bytesPerSec) {
 }
 
 function ping(v) {
-    if (v === undefined || v === null || v < 0)
+    // `v < 0` is false for NaN, so a malformed probe line would render as "NaN ms" — a
+    // measurement that reads as a value rather than as the absence of one.
+    if (v === undefined || v === null || !(v >= 0))
         return "—";
     return Math.round(v) + " ms";
 }

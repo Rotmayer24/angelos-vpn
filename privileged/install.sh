@@ -45,14 +45,28 @@ done
 [ -n "$srcdir" ] || srcdir="$(cd "$(dirname "$0")" && pwd)"
 
 # not group- or world-writable: on a shared machine another local user must not be able to
-# edit the sources between the prompt and the install
+# edit the sources between the prompt and the install.
+#
+# Both triads have to be checked. `case "$mode" in *[2367])` anchors on the LAST character of
+# `stat -c %a`, which is the "other" triad only — so 775, 770 and 764, every one of them
+# group-writable, sailed through. That is the check standing between another local user and
+# swapping the helper between the password prompt and a root run.
+#
+# Done arithmetically rather than by pattern, because the number of digits is not fixed: a
+# directory carrying setgid reports four (e.g. 2775), a plain file three.
 check_writable() {
     f="$1"
     [ -e "$f" ] || die "refusing: $f is missing"
     mode="$(stat -c %a "$f")"
+    # strip a leading setgid/sticky digit if present, so what remains is the owner/group/other triad
     case "$mode" in
-        *[2367]) die "refusing: $f is group/world-writable ($mode)" ;;
+        [0-7][0-7][0-7][0-7]) mode="${mode#?}" ;;
     esac
+    group=$(( 0$mode / 8 % 8 ))
+    other=$(( 0$mode % 8 ))
+    if [ $(( group & 2 )) -ne 0 ] || [ $(( other & 2 )) -ne 0 ]; then
+        die "refusing: $f is group/world-writable ($mode)"
+    fi
 }
 
 sha256_of() { sha256sum "$1" | cut -d' ' -f1; }

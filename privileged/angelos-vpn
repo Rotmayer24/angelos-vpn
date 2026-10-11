@@ -110,6 +110,13 @@ def valid_singbox(s):
             fail("refusing: the directory holding sing-box is writable by others: " + d)
         if caller_uid is not None and ds.st_uid == caller_uid:
             fail("refusing: the directory holding sing-box belongs to the calling user: " + d)
+        # Rejecting only the *calling* user left a hole: a directory owned by some other
+        # unprivileged account passed, and that account can rename the file out and put its
+        # own in its place — the swap this whole function exists to prevent, one directory
+        # further up. The owner has to be root, or the same account that owns the binary:
+        # the latter keeps Happ's build-uid layout working, since there the two match.
+        if ds.st_uid != 0 and ds.st_uid != st.st_uid:
+            fail("refusing: the directory holding sing-box belongs to another user: " + d)
     except OSError:
         pass
     return s
@@ -256,6 +263,14 @@ def build_config(socks, api, host, dns, apps, domains, kill, hy=None):
                 },
                 {"type": "direct", "tag": "direct", "domain_resolver": "local"},
             ],
+            # The traffic counters come from Xray's API everywhere else, and there is no
+            # Xray here — sing-box *is* the whole tunnel. Its clash API answers with
+            # cumulative upload/download totals, which is the same number the panel shows
+            # for every other server. Bound to loopback, like the Xray API inbound that
+            # normalize() builds: nothing outside this machine can read a user's traffic.
+            "experimental": {
+                "clash_api": {"external_controller": "127.0.0.1:%d" % api}
+            },
             "route": {
                 "rules": rules,
                 "final": "proxy",
@@ -359,6 +374,12 @@ def stop_running():
             if not alive(pid):
                 break
             time.sleep(0.1)
+        # Re-check before escalating. Those six seconds are long enough for the kernel to hand
+        # this pid to something else, and SIGKILL leaves no chance to notice: it would land on
+        # a stranger while we believe we are still cleaning up our own tunnel.
+        if alive(pid) and not is_sing_box(pid):
+            log_line("angelos-vpn: pid %d is no longer sing-box; not escalating" % pid)
+            pid = 0
         if alive(pid):
             try:
                 os.kill(pid, signal.SIGKILL)
@@ -384,25 +405,19 @@ def is_sing_box(pid):
     return os.path.basename(exe).startswith("sing-box")
 
 
-def caller_cache_dir():
-    """Where the plugin writes its cache, seen from the user who invoked us.
+def caller_uid():
+    """The uid of the user who invoked us, or None when there is no pkexec in the picture.
 
-    Under pkexec our own HOME is /root even though the file we have to read belongs to the
-    user sitting at the desktop. PKEXEC_UID names that user and is set by polkit rather than
-    by the caller, so it cannot be forged to point the lookup at another account.
+    PKEXEC_UID is set by polkit in the environment of the process it starts, so unlike an
+    argument it cannot be forged to point the lookup at another account. Without it we are
+    being run directly (the tests, or a developer at a shell) and our own uid is the caller's.
     """
     uid = os.environ.get("PKEXEC_UID", "")
-    if uid.isdigit():
-        try:
-            import pwd
-            home = pwd.getpwuid(int(uid)).pw_dir
-        except (ImportError, KeyError):
-            fail("unknown PKEXEC_UID: " + uid)
-        # the caller's cache is under their own home; our XDG_CACHE_HOME is root's and ours
-        return os.path.join(home, ".cache", "angelos-vpn")
-    # no pkexec in the picture (a direct run, the tests): our own environment is the caller's
-    return os.path.join(os.environ.get("XDG_CACHE_HOME") or
-                        os.path.join(os.path.expanduser("~"), ".cache"), "angelos-vpn")
+    if not uid:
+        return os.getuid()
+    if not uid.isdigit():
+        fail("PKEXEC_UID is not a number: " + uid)
+    return int(uid)
 
 
 def read_hy_file(path):
@@ -411,30 +426,32 @@ def read_hy_file(path):
     Anything in argv is world-readable through /proc while the command runs, so the password
     would belong to every process on the machine for as long as the tunnel was up. Here it
     arrives through a 0600 file that is deleted as soon as this returns — but the file is
-    still user-written data read by a root process, so every field is treated as hostile:
-    the path must be absolute, short, and free of anything but a name and a parent directory
-    we expect, and the values are re-checked rather than trusted.
+    still user-written data read by a root process, so every field is treated as hostile and
+    the values are re-checked rather than trusted.
+
+    What stops a subscription from aiming us at, say, /etc/shadow is not the path's shape but
+    its ownership: the file has to belong to the user who is asking. That is also why the
+    directory is not constrained here. Pinning it to "<home>/.cache/angelos-vpn" looked
+    stricter but broke every user who sets XDG_CACHE_HOME anywhere else — the plugin writes to
+    $XDG_CACHE_HOME, so a hardcoded default is simply the wrong directory for them, and Hysteria
+    then failed at the last step for everyone with a non-default cache. Ownership says the
+    thing that actually matters and holds regardless of where the plugin keeps its cache.
     """
     if not path:
         return None
     if not path.startswith("/") or len(path) > 4096 or "\0" in path or "\n" in path:
         fail("bad credentials path")
-    # Keep the caller inside the plugin's own cache dir: a path to, say, /etc/shadow would
-    # otherwise be read by root and handed to sing-box as a "password".
-    #
-    # The home directory has to be the *caller's*, not ours: pkexec resets the environment, so
-    # HOME here is /root and the plugin's file lives in the user's cache. PKEXEC_UID is set by
-    # polkit itself in the environment of the process it starts, so unlike an argument it
-    # cannot be forged — which is exactly what makes it safe to look a home directory up from.
-    cache = caller_cache_dir()
-    if os.path.dirname(os.path.realpath(path)) != os.path.realpath(cache):
-        fail("credentials must live in " + cache)
     try:
         st = os.stat(path)
     except OSError:
         fail("credentials file not found: " + path)
     if not stat.S_ISREG(st.st_mode):
         fail("credentials file is not a regular file")
+    uid = caller_uid()
+    # os.stat follows symlinks, so this checks the file that actually gets opened: a symlink
+    # the caller points at their own credentials is fine, one aimed at someone else's is not.
+    if st.st_uid != uid:
+        fail("credentials file does not belong to the calling user")
     if st.st_mode & (stat.S_IROTH | stat.S_IWOTH):
         fail("credentials file is readable by other users")
     if st.st_size > 8192:
@@ -667,19 +684,34 @@ def _diag_text(host=""):
 
 
 def _our_ports():
-    """The ports the running config listens on, read back from it."""
+    """The local ports this tunnel actually uses, read back from the running config.
+
+    Looking for `"protocol": "socks"` among the inbounds, as this once did, never found
+    anything: that is Xray's spelling, and the file read here is sing-box's, whose only inbound
+    is the TUN device. Nothing listens on a port because of it — Xray does, and sing-box names
+    Xray in an *outbound*, where the SOCKS port appears as its target. So the port is read from
+    there instead.
+
+    Returns [] when there is no such outbound, which is the Hysteria case: no core process is
+    running at all and no local port is expected. The caller prints that plainly rather than
+    two question marks, which read like a broken tunnel.
+    """
     try:
         with open(CFG) as f:
             cfg = json.load(f)
     except (OSError, ValueError):
         return []
-    socks = api = None
-    for ib in cfg.get("inbounds") or []:
-        if ib.get("protocol") == "socks":
-            socks = ib.get("port")
-        elif ib.get("protocol") == "dokodemo-door":
-            api = ib.get("port")
-    return [p for p in (socks, api) if isinstance(p, int)]
+    socks = None
+    for ob in cfg.get("outbounds") or []:
+        if ob.get("type") == "socks" and ob.get("server") == "127.0.0.1":
+            port = ob.get("server_port")
+            if isinstance(port, int):
+                socks = port
+            break
+    if socks is None:
+        return []
+    # the stats API sits a fixed 1000 above the socks port; that is how the plugin picks both
+    return [socks, socks + 1000]
 
 
 def cmd_diag(argv):

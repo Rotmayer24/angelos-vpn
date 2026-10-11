@@ -83,16 +83,47 @@ Singleton {
         }
         var data = _logPending;
         _logPending = "";
-        // the text goes in as an argument: no stdin, so a writer can never wedge open
-        logWrite.command = ["sh", "-c", "umask 077; printf %s \"$1\" >> \"$2\"", "sh", data, logFile];
+        logWrite.command = writeFileCmd(logFile, data, true);
         logWrite.running = true;
+    }
+    // Writes `data` to `path` with 0600, as one argv.
+    //
+    // A single argument cannot exceed MAX_ARG_STRLEN — 32 pages, 128 KiB on Linux — and the
+    // failure is silent: execve returns E2BIG, the shell never runs, and the file is simply
+    // not there. The limits were never close, though: a 1000-server subscription is ~259 KB
+    // and a full log dump ~145 KB, so `saveLogs` failed on a long session and a large
+    // subscription was silently never cached — the plugin would just re-fetch it next time
+    // and say nothing about it.
+    //
+    // The cap is per argument, not on the total: ARG_MAX is 2 MB, so the payload is split
+    // into 60 KB pieces and appended in order. That lifts the ceiling to roughly 2 MB, which
+    // is far past anything a subscription or a log dump reaches. stdin would avoid the split
+    // entirely but was abandoned earlier — a writer can wedge open and stall the connect.
+    function writeFileCmd(path, data, append) {
+        var chunk = 60000;
+        var script = "umask 077; " + (append ? "" : ": > \"$1\"; ");
+        var cmd = ["sh", "-c", "", "sh", path];
+        var n = 2;
+        for (var i = 0; i < data.length; i += chunk) {
+            // ${n} and not $n: with ten or more parts "$10" is not parameter ten — a POSIX
+            // shell reads it as $1 followed by a literal "0", so the tenth chunk silently
+            // became the output path. Anything past 500 KB, which is nine chunks and well
+            // within ARG_MAX, lost its tail that way.
+            script += "printf %s \"${" + n + "}\" >> \"$1\"; ";
+            cmd.push(data.substring(i, i + chunk));
+            n++;
+        }
+        if (append && data.length === 0)
+            script = "umask 077; : >> \"$1\"; ";
+        cmd[2] = script;
+        return cmd;
     }
     function saveLogs() {
         // a second Save while the first is in flight would change a command that never runs,
         // and the user would get no file and no message
         if (logDump.running)
             return;
-        logDump.command = ["sh", "-c", "umask 077; printf %s \"$1\" > \"$2\"", "sh", fullLog(), logDumpPath];
+        logDump.command = writeFileCmd(logDumpPath, fullLog(), false);
         logDump.running = true;
     }
     function clearLogs() {
@@ -186,6 +217,9 @@ Singleton {
     readonly property int healthTries: 3
     property int _healthTries: 0
     property bool helperInstalling: false
+    // set when an install or remove ended non-zero, so the TUN page can say so instead of
+    // letting the poll time out and look like a success
+    property bool helperInstallFailed: false
     property bool settingsOpen: false
     property var servers: []
     property var userinfo: ({})            // sub id -> {upload, download, total, expire}
@@ -218,6 +252,17 @@ Singleton {
     // the Hysteria credentials being written for the helper, kept apart from _writeData so a
     // subscription refresh landing at the same moment cannot clobber the file mid-connect
     property string _hyCredData: ""
+    // the server the connect in flight was started for. Every step that reads the server list
+    // afterwards compares against this, because a switch mid-connect otherwise leaves the
+    // config written for one server and the tunnel built for another.
+    property int _connectIndex: -1
+    // the user asked to stop, whatever the status still says. Set by disconnect() and cleared
+    // by the next beginConnect(), so a `up` that lands after a disconnect is recognised as a
+    // cancelled attempt rather than a failure or a success.
+    property bool _disconnecting: false
+    // dropHyCreds() found the credentials writer still running: it wants a second removal once
+    // that process is really gone, because the first one may have raced ahead of its redirection
+    property bool _hyCredDrop: false
     // the subscription body being written to the cache (kept apart from _writeData, which
     // belongs to the run config)
     property string _subData: ""
@@ -358,7 +403,7 @@ Singleton {
             _subPending = { "id": id, "raw": raw };
             return;
         }
-        subCacheWrite.command = ["sh", "-c", "umask 077; printf %s \"$1\" > \"$2\"", "sh", _subData, cacheDir + "/sub-" + id + ".json"];
+        subCacheWrite.command = writeFileCmd(cacheDir + "/sub-" + id + ".json", _subData, false);
         subCacheWrite.running = true;
     }
 
@@ -472,6 +517,23 @@ Singleton {
         return p < 65535 ? p : start;
     }
     function beginConnect() {
+        // The user asked to stop while the port scan was still running. Nothing has been
+        // started yet, so there is nothing to tear down either — carry on and the pipeline
+        // would bring the tunnel up behind the user's back.
+        if (_disconnecting) {
+            _disconnecting = false;
+            finishStop();
+            return;
+        }
+        // Every later step of the connect reads the server list again — `helperUp()` needs the
+        // host, the diagnostics need it for a route lookup. If the user switches servers while
+        // this pipeline is running, those readers see the NEW server while the config written
+        // just above belongs to the OLD one, and the helper then exempts only the new host from
+        // the tunnel: Xray's own connection to the old server gets captured by the tunnel it is
+        // serving, and the tunnel comes up dead. Pinning the index here is what every later
+        // reader checks against, so the mismatch is caught rather than acted on.
+        _connectIndex = selectedIndex;
+        _disconnecting = false;
         // Hysteria runs on sing-box itself, so in TUN mode there is no core to start at all:
         // the helper brings up the tunnel with the Hysteria outbound already wired in. Starting
         // Xray as well would leave a second process holding the same port range, and its own
@@ -494,7 +556,7 @@ Singleton {
         message = tr("Запускаю ядро…", "Starting the core…");
         // the text goes in as an argv entry: a stdin writer (write() + stdinEnabled=false)
         // wedges open on some runs, which stalls the whole connect and then fails
-        runWrite.command = ["sh", "-c", "umask 077; printf %s \"$1\" > \"$2\"", "sh", _writeData, runPath];
+        runWrite.command = writeFileCmd(runPath, _writeData, false);
         runWrite.running = true;
     }
     function disconnect() {
@@ -502,6 +564,29 @@ Singleton {
             return;
         if (mode === "tun") {
             message = tr("Отключаю…", "Disconnecting…");
+            // An explicit flag, because status is the wrong thing to test: in TUN mode this
+            // returns without changing it, so `up` would still see "connecting" and report a
+            // TUN failure over the disconnect the user just asked for.
+            _disconnecting = true;
+            // `up` is NOT killed here, and that is deliberate. Killing the client only kills
+            // pkexec: the helper is already root by then, so it carries on and starts sing-box
+            // anyway — after `down` has finished and torn the tunnel down. The machine ends up
+            // with two sing-box processes and a tunnel nobody asked for. Instead `up` is left to
+            // finish and `down` runs from its onExited, which serialises the two: the helper
+            // that goes up is always the one that comes back down.
+            //
+            // The case where the connect is still earlier in its pipeline — the port scan, the
+            // credentials — is the mirror of that: nothing is running yet, so `down` would go
+            // first and the pipeline would then bring the tunnel up behind it. Every step that
+            // could still call the helper therefore checks _disconnecting and abandons the
+            // connect instead. Down is only run here when there is genuinely something to tear
+            // down and nothing in flight that will report back.
+            if (hyCredWrite.running || upProc.running || portScan.running || runWrite.running
+                    || coreProc.running) {
+                if (hyCredWrite.running)
+                    hyCredWrite.running = false;
+                return;
+            }
             downProc.running = true;
         } else {
             stopCore();
@@ -534,7 +619,14 @@ Singleton {
         message = "";
         upSpeed = 0;
         downSpeed = 0;
+        // no connect is in flight any more; a stale index here would make the next guard
+        // compare against a server that has nothing to do with this stop
+        _connectIndex = -1;
         applySystemProxy(false);
+        // finishStop is where every stop ends up, whichever route it took, so this is the one
+        // place that reliably clears the credentials. teardownTun alone would miss the plain
+        // disconnect, and the file is the server's only secret.
+        dropHyCreds();
         if (_reconnect) {
             _reconnect = false;
             Qt.callLater(connect);
@@ -604,11 +696,24 @@ Singleton {
     // The helper deletes this file the moment it reads it, but a connect that fails before it
     // gets that far — a cancelled pkexec prompt, a bad password — would otherwise leave the
     // server's only credential sitting in the cache directory.
+    //
+    // Stopping the writer is not enough on its own, and returning early was the original bug:
+    // `sh -c '… > "$2"'` creates and truncates the file before printf writes a byte, so killing
+    // it leaves a file that is empty or half-written — and the early return meant nothing ever
+    // removed it. Issuing the removal unconditionally instead closes that, with one gap left:
+    // `running = false` only asks the process to stop, so an `rm` launched straight away can
+    // finish first and a writer that had not yet reached its redirection creates the file
+    // afterwards. Hence the flag: hyCredWrite removes it again on the way out, once the
+    // process is really gone. Two removals, no window in between.
     function dropHyCreds() {
         if (hyCredWrite.running) {
+            _hyCredDrop = true;
             hyCredWrite.running = false;
-            return;
         }
+        hyCredRemove.command = ["rm", "-f", hyCredPath];
+        hyCredRemove.running = true;
+    }
+    function rmHyCreds() {
         hyCredRemove.command = ["rm", "-f", hyCredPath];
         hyCredRemove.running = true;
     }
@@ -617,6 +722,8 @@ Singleton {
     // watchdog is the real guarantee — `qs kill` ends the process natively, so this may
     // never run — but taking the tunnel down here keeps a normal exit immediate.
     function shutdown() {
+        // a connect that was mid-flight when the shell exited never reached finishStop
+        dropHyCreds();
         if (status !== "on" && status !== "connecting")
             return;
         if (mode === "proxy") {
@@ -670,6 +777,12 @@ Singleton {
     }
     function writeHyCreds() {
         var s = currentServer || {};
+        if (_disconnecting) {
+            // cancelled before anything was written — see beginConnect
+            _disconnecting = false;
+            finishStop();
+            return;
+        }
         var hy = s.hy || {};
         if (!hy.password) {
             fail(tr("У сервера нет пароля Hysteria — подключиться нечем.",
@@ -685,12 +798,35 @@ Singleton {
             obfsPw: hy.obfsPw || ""
         });
         message = tr("Готовлю Hysteria…", "Preparing Hysteria…");
-        hyCredWrite.command = ["sh", "-c", "umask 077; printf %s \"$1\" > \"$2\"",
-                               "sh", _hyCredData, hyCredPath];
+        hyCredWrite.command = writeFileCmd(hyCredPath, _hyCredData, false);
         hyCredWrite.running = true;
     }
     function helperUp() {
+        // The last gate before root is reached. Both conditions matter: _disconnecting is the
+        // user's explicit cancel, and the status check is the backstop for the window where the
+        // cancel was already consumed — a `down` has run and set the status to "off", while the
+        // pipeline is still walking towards this call. Either way nothing has been started, so
+        // there is nothing to tear down afterwards.
+        if (_disconnecting || status !== "connecting") {
+            _disconnecting = false;
+            finishStop();
+            return;
+        }
+        // The connect in flight was started for _connectIndex. Reading currentServer here is
+        // what caused the loop: the user can switch servers while the core starts or the
+        // credentials are written, and the helper then exempts only the NEW server's address,
+        // so the core's own connection to the server the config was built for gets captured by
+        // the tunnel that depends on it. For Hysteria the same moment would pair the new
+        // server with the previous one's password.
         var s = currentServer || {};
+        if (_connectIndex >= 0 && s.index !== _connectIndex) {
+            log("server changed mid-connect; dropping it (wanted " + _connectIndex
+                + ", now " + s.index + ")");
+            dropHyCreds();
+            fail(tr("Сервер сменился, пока шла подготовка — попробуй ещё раз.",
+                    "The server changed while it was being prepared — try again."));
+            return;
+        }
         message = tr("Поднимаю TUN…", "Bringing up the TUN…");
         var args = ["pkexec", helperPath, "up",
             String(socksPort), String(apiPort), (s.host || ""), dns,
@@ -721,14 +857,18 @@ Singleton {
 
     // ---- traffic stats --------------------------------------------------------
     function startStats() {
-        // The counters come from Xray's own API, and a Hysteria connection has no Xray: the
-        // process would exit non-zero on every tick and leave the panel showing a permanent
-        // error over a tunnel that is working. Show nothing rather than something false.
-        if ((currentServer || {}).engine === "sing-box") {
-            statsTimer.running = false;
-            return;
-        }
         _lastStatsAt = 0;
+        upSpeed = 0;
+        downSpeed = 0;
+        // Hysteria in TUN mode has no Xray — sing-box is the whole tunnel — so its numbers
+        // come from sing-box's clash API instead, which reports the same cumulative totals.
+        // In proxy mode that server still goes through Xray, so it keeps the Xray query.
+        if (mode === "tun" && (currentServer || {}).engine === "sing-box")
+            statsProc.command = ["curl", "-s", "-m", "4",
+                "http://127.0.0.1:" + apiPort + "/connections"];
+        else
+            statsProc.command = [root.xrayPath, "api", "statsquery",
+                "--server=127.0.0.1:" + root.apiPort];
         statsTimer.running = true;
         if (!statsProc.running)
             statsProc.running = true;
@@ -805,21 +945,44 @@ Singleton {
 // root-owned copy, so nothing the user can write sits between the password prompt and a root
 // run — and polkit shows the translated "install the VPN helper" dialog instead of the
 // generic "Execute program".
-    function installHelper() {
+    function runInstaller(remove) {
         helperInstalling = true;
-        Quickshell.execDetached(["sh", "-c",
-            "if test -x \"$1\"; then exec \"$1\" \"$2\"; else exec pkexec \"$3\" \"$2\"; fi",
-            "sh", root.installerPath, plugDir + "privileged", plugDir + "privileged/install.sh"]);
+        helperInstallFailed = false;
+        // Both branches need pkexec. The installer refuses to run as anything but root, so
+        // exec'ing the root-owned copy directly meant the run died on its first line — and
+        // helperPoll then saw the still-present files and reported success. The root copy is
+        // what keeps the user's own copy of the script out of the trusted path; pkexec is what
+        // makes it root in the first place. Neither replaces the other.
+        var flag = remove ? "--remove" : "";
+        helperInstallProc.command = ["sh", "-c",
+            "if test -x \"$1\"; then exec pkexec \"$1\" \"$2\" " + flag + "; else exec pkexec \"$3\" \"$2\" " + flag + "; fi",
+            "sh", root.installerPath, plugDir + "privileged", plugDir + "privileged/install.sh"];
+        helperInstallProc.running = true;
         helperPoll.ticks = 0;
         helperPoll.restart();
     }
+    function installHelper() {
+        runInstaller(false);
+    }
     function removeHelper() {
-        helperInstalling = true;
-        Quickshell.execDetached(["sh", "-c",
-            "if test -x \"$1\"; then exec \"$1\" \"$2\" --remove; else exec pkexec \"$3\" \"$2\" --remove; fi",
-            "sh", root.installerPath, plugDir + "privileged", plugDir + "privileged/install.sh"]);
-        helperPoll.ticks = 0;
-        helperPoll.restart();
+        runInstaller(true);
+    }
+    // A refused or failed install used to end silently: the polkit dialog was cancelled, the
+    // run died, and helperPoll gave up on its timeout while the files it was checking were
+    // still sitting there from the previous install — reporting a success that never happened.
+    // A Process rather than execDetached, so that the exit code is actually available.
+    Process {
+        id: helperInstallProc
+        onExited: code => {
+            if (code === 0)
+                return;
+            root.helperInstalling = false;
+            root.helperInstallFailed = true;
+            root.helperPoll.running = false;
+            root.log("installer exited " + code);
+            root.message = root.tr("Установка не удалась — возможно, запрос пароля был отменён.",
+                                   "Install failed — the password prompt may have been cancelled.");
+        }
     }
     function refreshHelper() {
         helperCheck.running = true;
@@ -849,60 +1012,77 @@ Singleton {
             sysProxyProc.running = false;
         _sysProxyOn = on;
         if (on)
-            sysProxyProc.command = ["sh", "-c", proxySetCmd(_sysProxySaved), "sh", String(socksPort), String(httpPort)];
+            sysProxyProc.command = proxySetCmd();
         else
-            sysProxyProc.command = ["sh", "-c", proxyRestoreCmd(_sysProxySaved), "sh"];
+            sysProxyProc.command = proxyRestoreCmd(_sysProxySaved);
         sysProxyProc.running = true;
     }
     // Reads the current values (into _sysProxySaved) before the first change.
     function readSystemProxy() {
-        sysProxyRead.command = ["sh", "-c", proxyReadCmd()];
+        sysProxyRead.command = proxyReadCmd();
         sysProxyRead.running = true;
     }
     function proxyReadCmd() {
         var be = proxyBackend();
         if (be === "kde")
-            return "[ -x \"$(command -v kwriteconfig6 || command -v kwriteconfig)\" ] && kwriteconfig6 --file kdeglobals --group \"Proxy Settings\" || true";
-        return "gsettings get org.gnome.system.proxy mode 2>/dev/null || echo none; \
+            return ["sh", "-c",
+                "[ -x \"$(command -v kwriteconfig6 || command -v kwriteconfig)\" ] && kwriteconfig6 --file kdeglobals --group \"Proxy Settings\" || true"];
+        return ["sh", "-c", "gsettings get org.gnome.system.proxy mode 2>/dev/null || echo none; \
 gsettings get org.gnome.system.proxy.socks host 2>/dev/null || true; \
 gsettings get org.gnome.system.proxy.socks port 2>/dev/null || true; \
 gsettings get org.gnome.system.proxy.http host 2>/dev/null || true; \
 gsettings get org.gnome.system.proxy.http port 2>/dev/null || true; \
 gsettings get org.gnome.system.proxy.https host 2>/dev/null || true; \
-gsettings get org.gnome.system.proxy.https port 2>/dev/null || true; true";
+gsettings get org.gnome.system.proxy.https port 2>/dev/null || true; true"];
     }
-    function proxySetCmd(saved) {
-        if (proxyBackend() === "kde")
-            return "k=\"$(command -v kwriteconfig6 || command -v kwriteconfig)\"; \
+    function proxySetCmd() {
+        var kdeCmd = "k=\"$(command -v kwriteconfig6 || command -v kwriteconfig)\"; \
 [ -n \"$k\" ] && { \"$k\" --file kdeglobals --group \"Proxy Settings\" --key ProxyType Manual; \
 \"$k\" --file kdeglobals --group \"Proxy Settings\" --key socksProxy 127.0.0.1; \
-\"$k\" --file kdeglobals --group \"Proxy Settings\" --key socksProxyPort $1; \
+\"$k\" --file kdeglobals --group \"Proxy Settings\" --key socksProxyPort \"$1\"; \
 \"$k\" --file kdeglobals --group \"Proxy Settings\" --key httpProxy 127.0.0.1; \
-\"$k\" --file kdeglobals --group \"Proxy Settings\" --key httpProxyPort $2; }; true";
-        return "gsettings set org.gnome.system.proxy mode manual 2>/dev/null; \
+\"$k\" --file kdeglobals --group \"Proxy Settings\" --key httpProxyPort \"$2\"; }; true";
+        var gnomeCmd = "gsettings set org.gnome.system.proxy mode manual 2>/dev/null; \
 gsettings set org.gnome.system.proxy.socks host 127.0.0.1 2>/dev/null; \
-gsettings set org.gnome.system.proxy.socks port $1 2>/dev/null; \
+gsettings set org.gnome.system.proxy.socks port \"$1\" 2>/dev/null; \
 gsettings set org.gnome.system.proxy.http host 127.0.0.1 2>/dev/null; \
-gsettings set org.gnome.system.proxy.http port $2 2>/dev/null; \
+gsettings set org.gnome.system.proxy.http port \"$2\" 2>/dev/null; \
 gsettings set org.gnome.system.proxy.https host 127.0.0.1 2>/dev/null; \
-gsettings set org.gnome.system.proxy.https port $2 2>/dev/null; true";
+gsettings set org.gnome.system.proxy.https port \"$2\" 2>/dev/null; true";
+        return proxyBackend() === "kde"
+            ? ["sh", "-c", kdeCmd, "sh", String(socksPort), String(httpPort)]
+            : ["sh", "-c", gnomeCmd, "sh", String(socksPort), String(httpPort)];
     }
+    // The values restored here come back from `gsettings get`, so they are the user's own
+    // stored settings — but "own" is not "safe to paste into a shell". A value holding a
+    // space, a `;`, `$(...)` or a backtick either breaks the command or runs one, and this
+    // executes on disconnect, when nobody is watching. Anything able to write the user's dconf
+    // database — a roaming profile, another process on the machine — would be choosing what
+    // runs. They go in as positional arguments, the way proxySetCmd passes its ports, so
+    // nothing is ever re-parsed by the shell.
     function proxyRestoreCmd(saved) {
         var s = saved || [];
-        if (proxyBackend() === "kde")
-            return "k=\"$(command -v kwriteconfig6 || command -v kwriteconfig)\"; \
-[ -n \"$k\" ] && \"$k\" --file kdeglobals --group \"Proxy Settings\" --key ProxyType " + (s[0] || "None") + "; true";
         var g = function (i, fallback) {
             var v = (s[i] || "").trim().replace(/^'|'$/g, "");
             return v.length ? v : fallback;
         };
-        return "gsettings set org.gnome.system.proxy mode " + g(0, "none") + " 2>/dev/null; \
-gsettings set org.gnome.system.proxy.socks host " + g(1, "127.0.0.1") + " 2>/dev/null; \
-gsettings set org.gnome.system.proxy.socks port " + g(2, "1080") + " 2>/dev/null; \
-gsettings set org.gnome.system.proxy.http host " + g(3, "127.0.0.1") + " 2>/dev/null; \
-gsettings set org.gnome.system.proxy.http port " + g(4, "8080") + " 2>/dev/null; \
-gsettings set org.gnome.system.proxy.https host " + g(5, "127.0.0.1") + " 2>/dev/null; \
-gsettings set org.gnome.system.proxy.https port " + g(6, "443") + " 2>/dev/null; true";
+        var args = [g(0, "none"), g(1, "127.0.0.1"), g(2, "1080"),
+                    g(3, "127.0.0.1"), g(4, "8080"),
+                    g(5, "127.0.0.1"), g(6, "443")];
+        if (proxyBackend() === "kde")
+            return ["sh", "-c",
+                "k=\"$(command -v kwriteconfig6 || command -v kwriteconfig)\"; \
+[ -n \"$k\" ] && \"$k\" --file kdeglobals --group \"Proxy Settings\" --key ProxyType \"$1\"; true",
+                "sh", args[0]];
+        return ["sh", "-c",
+            "gsettings set org.gnome.system.proxy mode \"$1\" 2>/dev/null; \
+gsettings set org.gnome.system.proxy.socks host \"$2\" 2>/dev/null; \
+gsettings set org.gnome.system.proxy.socks port \"$3\" 2>/dev/null; \
+gsettings set org.gnome.system.proxy.http host \"$4\" 2>/dev/null; \
+gsettings set org.gnome.system.proxy.http port \"$5\" 2>/dev/null; \
+gsettings set org.gnome.system.proxy.https host \"$6\" 2>/dev/null; \
+gsettings set org.gnome.system.proxy.https port \"$7\" 2>/dev/null; true",
+            "sh"].concat(args);
     }
 
     // ---- settings setters -----------------------------------------------------
@@ -1203,6 +1383,22 @@ gsettings set org.gnome.system.proxy.https port " + g(6, "443") + " 2>/dev/null;
     Process {
         id: hyCredWrite
         onExited: code => {
+            // the process is genuinely gone now, so the removal dropHyCreds() issued while it
+            // was still alive can be repeated safely — and has to be, or a redirection that
+            // landed after that first `rm` leaves the credentials behind
+            if (root._hyCredDrop) {
+                root._hyCredDrop = false;
+                root.rmHyCreds();
+                return;
+            }
+            // disconnected while the credentials were being written: there is nothing to bring
+            // up, and nothing to bring down either — disconnect() saw this process running and
+            // deferred, so the teardown is owed here to leave the state machine settled
+            if (root._disconnecting) {
+                root._disconnecting = false;
+                root.finishStop();
+                return;
+            }
             if (code !== 0) {
                 root.fail(root.tr("Не удалось записать учётные данные Hysteria",
                                   "Could not write the Hysteria credentials"));
@@ -1333,6 +1529,30 @@ gsettings set org.gnome.system.proxy.https port " + g(6, "443") + " 2>/dev/null;
             if (e)
                 root.log("helper up err: " + e.split("\n").slice(-1)[0]);
             root.log("helper up exit=" + code);
+            // A disconnect during the pkexec prompt leaves the user cancelling, not failing.
+            // Reporting a TUN failure here would overwrite the "Disconnecting…" the user just
+            // asked for — and finalizeOn() on success would set "connected" for a tunnel that
+            // `down` has already taken away. The flag rather than the status, because in TUN
+            // mode disconnect() returns without changing the status: the test the file already
+            // uses for portCheck ("a cancelled connect must not reach the code that acts on
+            // success") would not have fired here.
+            if (root._disconnecting || root.status !== "connecting") {
+                // The user asked to stop while this was in flight. `up` was deliberately not
+                // killed (see disconnect()), so the helper may well have brought the tunnel up
+                // anyway — run `down` now that it is finished. Doing it here rather than in
+                // disconnect() is what keeps the two from overlapping as root processes.
+                if (root._disconnecting && !downProc.running) {
+                    // `downProc` unqualified: it is an id, not a property, so `root.downProc`
+                    // does not resolve and throws a TypeError here — which aborts this handler
+                    // before the teardown runs. The rest of the file already writes it bare.
+                    //
+                    // No _tunDownQuiet here: that flag is for the silent stale-TUN sweep at
+                    // startup, and it makes downProc skip stopCore() — which would leave the
+                    // status at "connecting" for ever, since nothing else moves it
+                    downProc.running = true;
+                }
+                return;
+            }
             if (code === 0) {
                 root.finalizeOn();
             } else if (root.missingBins.indexOf("singbox") >= 0) {
@@ -1467,20 +1687,31 @@ gsettings set org.gnome.system.proxy.https port " + g(6, "443") + " 2>/dev/null;
 
     Process {
         id: helperCheck
-        command: ["sh", "-c", "test -x \"$1\" && test -f \"$2\" && test -x \"$3\"", "sh", root.helperPath, root.policyPath, root.installerPath]
+        command: ["sh", "-c",
+            "test -x \"$1\" && test -f \"$2\" && echo helper-ok; test -x \"$3\" && echo installer-ok; true",
+            "sh", root.helperPath, root.policyPath, root.installerPath]
         onExited: code => {
-            // the root-owned installer is what makes installs safe; without it we still have a
-            // working helper, but every later change would fall back to the plugin directory
-            root.installerReady = (code === 0);
-            root.helperInstalled = root.installerReady;
+            // Two separate questions, and conflating them is how the emergency button stopped
+            // working. "Is there a helper I can bring the TUN down with?" is what forceOff()
+            // asks before it promises to restore the network — the helper and its policy, and
+            // nothing else. "Is there a root-owned copy of the installer?" is only about how a
+            // later install would be performed. Deriving the first from the second meant that
+            // deleting /usr/local/libexec/angelos-vpn-install left a perfectly working helper
+            // that forceOff() refused to use, holding the machine offline.
+            var out = (helperOut.text || "");
+            root.helperInstalled = out.indexOf("helper-ok") >= 0;
+            root.installerReady = out.indexOf("installer-ok") >= 0;
             root.log("helper installed: " + root.helperInstalled + " (root installer: " + root.installerReady + ")");
             // a TUN left over from an earlier shell run would still hold the network captive:
             // take it down once, quietly, as soon as we know the helper is there
-            if (code === 0 && !root._staleCleaned) {
+            if (root.helperInstalled && !root._staleCleaned) {
                 root._staleCleaned = true;
                 root._tunDownQuiet = true;
                 downProc.running = true;
             }
+        }
+        stdout: StdioCollector {
+            id: helperOut
         }
     }
 
@@ -1530,13 +1761,24 @@ gsettings set org.gnome.system.proxy.https port " + g(6, "443") + " 2>/dev/null;
             } catch (e) {
                 return;
             }
-            var st = j.stat || [];
             var up = 0, down = 0;
-            for (var i = 0; i < st.length; i++) {
-                if (st[i].name === "outbound>>>proxy>>>traffic>>>uplink")
-                    up = parseInt(st[i].value || "0", 10);
-                else if (st[i].name === "outbound>>>proxy>>>traffic>>>downlink")
-                    down = parseInt(st[i].value || "0", 10);
+            if (j && j.uploadTotal !== undefined) {
+                // sing-box clash API: cumulative totals, already parsed
+                up = parseInt(j.uploadTotal || 0, 10);
+                down = parseInt(j.downloadTotal || 0, 10);
+                if (!(up >= 0))
+                    up = 0;
+                if (!(down >= 0))
+                    down = 0;
+            } else {
+                // Xray: a list of counters, the proxy's two of which are what the panel shows
+                var st = j.stat || [];
+                for (var i = 0; i < st.length; i++) {
+                    if (st[i].name === "outbound>>>proxy>>>traffic>>>uplink")
+                        up = parseInt(st[i].value || "0", 10);
+                    else if (st[i].name === "outbound>>>proxy>>>traffic>>>downlink")
+                        down = parseInt(st[i].value || "0", 10);
+                }
             }
             var now = Date.now();
             if (root._lastStatsAt) {
@@ -1574,6 +1816,10 @@ gsettings set org.gnome.system.proxy.https port " + g(6, "443") + " 2>/dev/null;
                     continue;
                 var idx = parseInt(lines[i].slice(0, t), 10);
                 var ms = parseInt(lines[i].slice(t + 1), 10);
+                // a truncated or malformed line parses to NaN, and storing that would leave the
+                // server showing a measurement forever. Leave the entry as it was instead.
+                if (!(ms >= 0))
+                    continue;
                 if (idx >= 0 && idx < list.length)
                     list[idx] = Object.assign({}, list[idx], { "ping": ms });
             }

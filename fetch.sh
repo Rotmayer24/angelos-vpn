@@ -26,7 +26,16 @@ esac
 
 host=$(printf '%s' "$url" | sed -E 's#^[a-zA-Z]+://([^/:]+).*#\1#')
 port=$(printf '%s' "$url" | sed -nE 's#^[a-zA-Z]+://[^/:]+:([0-9]+).*#\1#p')
-[ -n "$port" ] || port=443
+# The default port depends on the scheme. Hardcoding 443 meant an http:// subscription without
+# an explicit port got `--resolve host:443:addr`, which never matches — so curl silently fell
+# back to its own resolution and the whole A-record walkthrough this script exists for did
+# nothing at all for plain HTTP, with nothing to say so.
+if [ -z "$port" ]; then
+    case "$url" in
+        https://*) port=443 ;;
+        http://*)  port=80 ;;
+    esac
+fi
 
 echo "angelos-fetch resolve" >&2
 ips=$(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | sort -u)
@@ -36,11 +45,15 @@ total=$(printf '%s\n' $ips | grep -c .)
 [ "$total" -gt 0 ] || total=1
 
 fetch_ip() {
+    # -L: a 302 is not an HTTP error, so curl without it exits 0 and hands back the redirect
+    # body — usually empty. The plugin then parsed "" and reported "subscription not
+    # recognised" with no reason attached, while the provider was perfectly reachable. A
+    # provider that moved its subscription URL would look like a broken plugin.
     if [ -n "$hw" ]; then
-        curl -fsS --connect-timeout 8 --max-time 40 -A "v2rayNG/1.8.5" \
+        curl -fsSL --connect-timeout 8 --max-time 40 -A "v2rayNG/1.8.5" \
             -H "X-HWID: $hw" --resolve "$host:$port:$1" -D "$hdr" "$url" 2>/dev/null
     else
-        curl -fsS --connect-timeout 8 --max-time 40 -A "v2rayNG/1.8.5" \
+        curl -fsSL --connect-timeout 8 --max-time 40 -A "v2rayNG/1.8.5" \
             --resolve "$host:$port:$1" -D "$hdr" "$url" 2>/dev/null
     fi
 }

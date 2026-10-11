@@ -197,8 +197,13 @@ Column {
                 text: String(Vpn.socksPort)
                 onAccepted: {
                     // the setter validates and reports; on refusal the field snaps back so the
-                    // stored value and what is on screen never disagree
-                    if (!Vpn.setPorts(parseInt(text, 10), Vpn.httpPort))
+                    // stored value and what is on screen never disagree.
+                    // The raw text, not parseInt(text): the setter's own guard is
+                    // `String(port) === text.trim()`, which is what rejects "11080abc". Handing
+                    // it an already-parsed number made that comparison an identity and the
+                    // garbage through — the field would then keep showing it while the stored
+                    // value was right.
+                    if (!Vpn.setPorts(text, Vpn.httpPort))
                         text = String(Vpn.socksPort);
                 }
             }
@@ -210,7 +215,8 @@ Column {
                 width: Skin.px(130)
                 text: String(Vpn.httpPort)
                 onAccepted: {
-                    if (!Vpn.setPorts(Vpn.socksPort, parseInt(text, 10)))
+                    // raw text again, for the same reason as the socks field above
+                    if (!Vpn.setPorts(Vpn.socksPort, text))
                         text = String(Vpn.httpPort);
                 }
             }
