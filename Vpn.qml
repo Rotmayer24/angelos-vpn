@@ -1632,6 +1632,43 @@ gsettings set org.gnome.system.proxy.https port \"$7\" 2>/dev/null; true",
         }
     }
 
+    // Is the tunnel still up? The health check above runs once, after connecting: it answers
+    // "did the tunnel come up", not "is it still there". Nothing watched afterwards, so when
+    // the tunnel went away on its own — the watchdog taking it down, a crash, a reboot of
+    // something in the way — the panel went on saying "connected" and traffic went straight
+    // out unencrypted. Asking the helper is exact: it reports the state of the process that
+    // owns the interface, with no network round trip to second-guess, so a passing outage
+    // does not tear down a tunnel that is working.
+    Timer {
+        id: tunWatch
+        interval: 15000
+        repeat: true
+        running: root.status === "on" && root.mode === "tun"
+        onTriggered: {
+            if (!tunAliveProc.running)
+                tunAliveProc.running = true;
+        }
+    }
+
+    Process {
+        id: tunAliveProc
+        command: ["pkexec", root.helperPath, "status"]
+        stdout: StdioCollector {
+            id: tunAliveOut
+        }
+        onExited: code => {
+            if (root.status !== "on" || root.mode !== "tun")
+                return;
+            var state = (tunAliveOut.text || "").trim();
+            if (state === "down") {
+                root.log("tunnel is gone (helper reports down) while the UI shows connected");
+                root._healthTries = 0;
+                root.fail(root.tr("Туннель исчез — сеть вернулась напрямую. Возможно, оболочка была перезапущена.",
+                                  "The tunnel is gone — traffic is going out directly. The shell may have been restarted."));
+            }
+        }
+    }
+
     // ---- diagnostics plumbing -------------------------------------------------
     Timer {
         id: logFlush

@@ -559,6 +559,15 @@ def shell_alive():
     children through a systemd scope, so their PPID is systemd, not the shell. Looking for
     the shell itself is therefore both simpler and more robust than being handed a pid — it
     does not care how the caller was started.
+
+    Matching the `-c angelos` argument alone is NOT enough, and cost a live tunnel: once
+    Quickshell is running it rewrites its own process title to just "quickshell" and the
+    configuration argument is gone from /proc. The guard then saw no shell, concluded it had
+    died, and tore the tunnel down while the desktop kept showing "connected". So the
+    executable is matched too — and a bare quickshell counts as a shell, because the two
+    failures are not equal: a false negative takes the network down on a running desktop,
+    while a false positive leaves a tunnel up for a stray instance to be reaped by the
+    normal disconnect.
     """
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
@@ -571,13 +580,22 @@ def shell_alive():
                 cmd = f.read().split(b"\0")
         except OSError:
             continue
-        # "qs -c angelos": quickshell's own binary running the angelOS config
-        if len(cmd) >= 2 and b"qs" in os.path.basename(cmd[0]) \
-                and any(a == b"angelos" for a in cmd[1:]):
-            return True
-        # the guard binary runs as "angelos-vpn guard"; never mistake it for the shell
-        if os.path.basename(cmd[0]) == "angelos-vpn":
+        if not cmd or not cmd[0]:
             continue
+        base = os.path.basename(cmd[0])
+        # the guard binary runs as "angelos-vpn guard"; never mistake it for the shell
+        if base.startswith(b"angelos-vpn"):
+            continue
+        # fast path: the wrapper still has its arguments, "qs -c angelos"
+        if base in (b"qs", b"quickshell") and any(a == b"angelos" for a in cmd[1:]):
+            return True
+        # Quickshell has rewritten its title; fall back to the executable behind the pid
+        try:
+            exe = os.path.basename(os.readlink("/proc/%d/exe" % pid))
+        except OSError:
+            continue
+        if exe in ("quickshell", "qs"):
+            return True
     return False
 
 

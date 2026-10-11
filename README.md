@@ -177,6 +177,17 @@ The helper therefore starts a **watchdog** of its own: while an angelOS shell is
 running it does nothing, and the moment the last one is gone it takes the tunnel
 down. Typical case: about two seconds, no reboot.
 
+Recognising "an angelOS shell" means matching the running quickshell process, by its
+executable rather than only by the `-c angelos` argument: once Quickshell is running it
+rewrites its own process title and that argument is no longer in `/proc`. Matching on
+the argument alone made the watchdog tear down a live tunnel on a working desktop.
+
+And because the tunnel can still go away for reasons the watchdog did not cause, the
+plugin asks the helper whether it is still up every 15 seconds while connected in TUN
+mode. Without that the panel went on reading "connected" after the interface was gone,
+and traffic left the machine unencrypted. The question is put to the helper rather than
+to the network: a passing outage should not be mistaken for a dead tunnel.
+
 ## The subscription
 
 `Subscriptions.js` understands both shapes a Happ-style endpoint can return:
