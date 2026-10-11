@@ -581,8 +581,19 @@ Singleton {
             // could still call the helper therefore checks _disconnecting and abandons the
             // connect instead. Down is only run here when there is genuinely something to tear
             // down and nothing in flight that will report back.
+            //
+            // `coreProc` is deliberately NOT part of that test, though it looks like it belongs:
+            // once a connection is established the core is always running, so waiting for it to
+            // exit means waiting for ever — nothing here kills it, because that is downProc's
+            // onExited calling stopCore(), which only runs once `down` has been asked for. The
+            // condition therefore held for every live TUN session, and "Disconnect" returned
+            // having done nothing: the tunnel stayed up and the panel stayed connected. A
+            // server switch hit the same wall — selectServer() sets _reconnect and disconnects,
+            // the disconnect silently did nothing, and the switch never happened.
+            // Order is unchanged and still the safe one: `down` tears the tunnel down, and only
+            // its exit stops the core.
             if (hyCredWrite.running || upProc.running || portScan.running || runWrite.running
-                    || coreProc.running) {
+                    || downProc.running || _stopping) {
                 if (hyCredWrite.running)
                     hyCredWrite.running = false;
                 return;
@@ -622,6 +633,13 @@ Singleton {
         // no connect is in flight any more; a stale index here would make the next guard
         // compare against a server that has nothing to do with this stop
         _connectIndex = -1;
+        // Likewise the disconnect flag. It is set the moment the user asks to stop and the
+        // pipeline steps clear it as they abandon themselves — but finishStop is also reached
+        // by the ordinary disconnect, where no pipeline step ever runs to clear it. It then
+        // stayed set, and the NEXT connect walked into the cancellation branch of beginConnect
+        // and gave up silently: no "connected", no error, just a dead toggle. A server switch
+        // hit it every time, because switching is a disconnect followed by a reconnect.
+        _disconnecting = false;
         applySystemProxy(false);
         // finishStop is where every stop ends up, whichever route it took, so this is the one
         // place that reliably clears the credentials. teardownTun alone would miss the plain
