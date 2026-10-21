@@ -1,9 +1,6 @@
 {
   "id": "vpn",
-  "name": {
-    "ru": "VPN",
-    "en": "VPN"
-  },
+  "name": "VPN",
   "version": "1.1.2",
   "author": "SugarJora",
   "description": {
